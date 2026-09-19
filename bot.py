@@ -1,4 +1,4 @@
-# BOTS VÓLEY V1.06 — aplicación autónoma.
+# BOTS VÓLEY V1.07 — aplicación autónoma.
 # Las fuentes van incluidas en este archivo, sin imports de archivos locales.
 # Se preservan espacios de nombres independientes para evitar colisiones.
 import sys as _sys
@@ -82,7 +82,7 @@ def calendar(force=False):
         if not force and cached and time.time()-cached[0]<cached[3]:
             out.extend(cached[1]);reasons.append(cached[2]);continue
         try:
-            req=Request(cfg['url'],headers={'User-Agent':'BOTS-VOLEY/1.06'})
+            req=Request(cfg['url'],headers={'User-Agent':'BOTS-VOLEY/1.07'})
             with urlopen(req,timeout=8) as response:
                 raw=response.read(2_000_000)
             try:html=raw.decode('utf-8')
@@ -96,6 +96,101 @@ def calendar(force=False):
         CACHE[key]=(time.time(),rows,reason,ttl)
         out.extend(rows);reasons.append(reason)
     return out,reasons
+
+# Calendario oficial NCAA: esquema JSON-LD publicado por San Diego State.
+SDSU_URL='https://goaztecs.com/sports/volleyball/schedule'
+class JsonScripts(HTMLParser):
+    def __init__(self):
+        super().__init__();self.capture=False;self.buff=[];self.scripts=[]
+    def handle_starttag(self,tag,attrs):
+        if tag=='script' and dict(attrs).get('type')=='application/ld+json':
+            self.capture=True;self.buff=[]
+    def handle_data(self,data):
+        if self.capture:self.buff.append(data)
+    def handle_endtag(self,tag):
+        if tag=='script' and self.capture:
+            self.scripts.append(''.join(self.buff));self.capture=False
+
+
+def parse_sdsu(html,now=None):
+    import json,re,hashlib
+    import catalog as c
+    now=time.time() if now is None else now
+    parser=JsonScripts();parser.feed(html);out=[]
+    def walk(obj):
+        if isinstance(obj,list):
+            for x in obj:walk(x)
+        elif isinstance(obj,dict):
+            if obj.get('@type') in ('Event','SportsEvent'):
+                name=obj.get('name','')
+                pair=re.fullmatch(r'SDSU\s+(vs\.?|at)\s+(.+)',name)
+                raw=obj.get('startDate','')
+                # Require an explicit timezone; never infer time from a date-only value.
+                ts=c.timestamp(raw) if re.search(r'(Z|[+-]\d\d:\d\d)$',raw) else None
+                if pair and ts:
+                    rival=pair[2].strip()
+                    if re.search(r'\b(tbd|championship|tournament|invitational)\b',rival,re.I):return
+                    home,away=('San Diego State Aztecs',rival) if pair[1].startswith('vs') else (rival,'San Diego State Aztecs')
+                    raw_state=obj.get('eventStatus','').split('/')[-1]
+                    state={'EventCancelled':'CANC','EventPostponed':'PST'}.get(raw_state,'NS' if ts>now else 'UNKNOWN')
+                    ident=hashlib.sha256(f'{home}|{away}|{ts}'.encode()).hexdigest()[:20]
+                    m=c.make_match('ncaa_sdsu',ident,ts,home,away,'NCAA Women · San Diego State schedule',state)
+                    m['_official_url']=SDSU_URL;m['_best_of']=5
+                    out.append(m)
+            for val in obj.values():
+                if isinstance(val,(dict,list)):walk(val)
+    for script in parser.scripts:
+        try:walk(json.loads(script))
+        except (ValueError,TypeError):continue
+    return out
+
+
+def sdsu_calendar(force=False):
+    key='ncaa_sdsu';cached=CACHE.get(key)
+    if not force and cached and time.time()-cached[0]<cached[3]:return cached[1],[cached[2]]
+    try:
+        with urlopen(Request(SDSU_URL,headers={'User-Agent':'BOTS-VOLEY/1.07'}),timeout=8) as r:
+            text=r.read(3_000_000).decode('utf-8')
+        rows=parse_sdsu(text)
+        if not rows:raise ValueError('calendario no reconocido')
+        reason='ok';ttl=300
+    except Exception as exc:
+        rows=[];reason=type(exc).__name__;ttl=30
+    CACHE[key]=(time.time(),rows,reason,ttl)
+    return rows,[reason]
+
+
+norceca_calendar=calendar
+
+def calendar(force=False):
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        a=pool.submit(norceca_calendar,force);b=pool.submit(sdsu_calendar,force)
+        ar,am=a.result();br,bm=b.result()
+    return ar+br,am+bm
+
+
+def history_summary(match):
+    """Descriptive, pre-kickoff observations. No uncalibrated win probabilities."""
+    import catalog as c
+    if match.get('_source')!='norceca':return []
+    rows,_=norceca_calendar()
+    eligible=[r for r in rows if r['timestamp']<match['timestamp'] and r['id']!=match['id']
+              and r['league']['name']==match['league']['name']
+              and r['status']['short']=='FT' and not r.get('_data_issue')]
+    result=[]
+    for side in ['home','away']:
+        name=match['teams'][side]['name'];values=[]
+        for row in eligible:
+            hn=c.canonical(row['teams']['home']['name']);an=c.canonical(row['teams']['away']['name'])
+            if c.canonical(name) not in (hn,an):continue
+            h=row['scores'].get('home');a=row['scores'].get('away')
+            if h is None or a is None:continue
+            values.append((h,a) if c.canonical(name)==hn else (a,h))
+        n=len(values);wins=sum(a>b for a,b in values)
+        result.append({'team':name,'n':n,'wins':wins,'losses':n-wins,
+                       'sets_for':sum(a for a,b in values),'sets_against':sum(b for a,b in values)})
+    return result
 
 '''
 
@@ -317,7 +412,7 @@ def fetch(source, url, parser, headers=None, force=False):
         if not force and cached and now - cached[0] < cached[3]:
             return cached[1], cached[2]
     try:
-        req = Request(url, headers={'User-Agent': 'BOTS-VOLEY/1.06', 'Accept': 'application/json', **(headers or {})})
+        req = Request(url, headers={'User-Agent': 'BOTS-VOLEY/1.07', 'Accept': 'application/json', **(headers or {})})
         with urlopen(req, timeout=TIMEOUT) as r:
             data = json.loads(r.read(8_000_000).decode('utf-8'))
         if not isinstance(data, dict) or data.get('errors'):
@@ -374,13 +469,13 @@ def catalog(day=None):
         meta.setdefault(src, []).append(reason)
     official_rows, official_reasons = official_future.result()
     rows.extend(m for m in official_rows if day_of(m) == day)
-    meta['norceca'] = official_reasons
+    meta['official'] = official_reasons
     return dedupe(rows), meta
 
 
 def refresh(m):
     src, eid = m['_source'], m['_source_id']
-    if src == 'norceca':
+    if src in {'norceca','ncaa_sdsu'}:
         rows, reasons = official.calendar(force=True)
         return next((x for x in rows if x['id'] == m['id']), None)
     if src == 'api':
@@ -447,7 +542,7 @@ from datetime import datetime, timezone, timedelta
 from urllib.parse import urlencode
 from urllib.request import urlopen, Request
 
-VERSION = "1.06"
+VERSION = "1.07"
 LIMA = timezone(timedelta(hours=-5))
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 VOLLEY_API_KEY = os.getenv("VOLLEY_API_KEY", "").strip()
@@ -676,6 +771,16 @@ def set_distribution(ph):
 
 
 
+def historical_lines(m):
+    summary=sources.official.history_summary(m)
+    if not summary or not any(x['n'] for x in summary): return []
+    lines=['', '📊 HISTORIAL ANTERIOR AL PARTIDO']
+    for x in summary:
+        lines += [x['team'],f"Muestra válida: {x['n']} partidos",f"Victorias/derrotas: {x['wins']}/{x['losses']}",f"Sets ganados/perdidos: {x['sets_for']}/{x['sets_against']}"]
+    lines += ['Lectura descriptiva del torneo, ante rivales diferentes.', 'Se excluyen resultados contradictorios; no es una probabilidad de victoria.', '']
+    return lines
+
+
 def render(m):
     hn,an=names(m); st=status_short(m)
     lines=[f'🏐 BOTS VÓLEY — V{VERSION}',f'{hn} vs {an}',f'🏆 {league_text(m)}',f'📅 {datetime.fromtimestamp(m["timestamp"],LIMA).strftime("%d/%m/%Y")} · {kickoff_text(m)}']
@@ -688,16 +793,20 @@ def render(m):
         if m.get('_data_issue'): lines.append(m['_data_issue'])
         lines.append('Sin propuestas activas.'); return '\n'.join(lines)
     if st=='UNKNOWN':
-        lines += ['Encuentro localizado. Estado y marcador actuales sin confirmar.', 'Sin propuesta hasta confirmar el estado.']
+        lines += ['Estado y marcador actuales sin confirmar.']
+        lines += historical_lines(m)
+        lines += ['Sin propuesta LIVE sustentada hasta confirmar el estado.']
         return '\n'.join(lines)
     if is_live(m):
         sc=m.get('scores') or {}
         lines += ['⏱ LIVE', f"Sets: {sc.get('home') if sc.get('home') is not None else '?'}-{sc.get('away') if sc.get('away') is not None else '?'}"]
         pts=live_points(m)
         if pts: lines.append(f'Puntos del último set informado: {pts[0]}-{pts[1]}')
+        lines += historical_lines(m)
         lines += ['Probabilidades LIVE: todavía sin modelo validado.', 'SIN PROPUESTA CONFIABLE.']
         return '\n'.join(lines)
     lines.append('⏱ PRE')
+    lines += historical_lines(m)
     model=pre_model(m)
     if not model['hs'] or not model['as']:
         lines += ['Respaldo estadístico: insuficiente.', 'Ganador: sin porcentaje sustentado.', 'Sets, puntos y hándicap: sin estimación sustentada.', 'SIN PROPUESTA CONFIABLE.']
@@ -711,7 +820,13 @@ def render(m):
     return '\n'.join(lines)
 
 
-def choose(chat_id,m):
+def choose(chat_id,m, refresh=True):
+    if refresh:
+        updated=sources.refresh(m)
+        if updated is not None: m=updated
+        else:
+            m=dict(m);m['status']={'short':'UNKNOWN'}
+            m['_refresh_failed']=True
     state=STATE.setdefault(chat_id,{})
     state['_active']=m
     state.pop('_options',None)
@@ -722,7 +837,7 @@ def handle(chat_id,text):
     t=(text or '').strip()
     if not t: return
     if t.lower() in {'/start','start','inicio'}:
-        send(chat_id, '🏐 BOTS VÓLEY V1.06\nEscribe los equipos, PARTIDOS DE HOY o AHORA.\nBúsqueda multifuente con horario de Perú.'); return
+        send(chat_id, '🏐 BOTS VÓLEY V1.07\nEscribe los equipos, PARTIDOS DE HOY o AHORA.\nBúsqueda multifuente con horario de Perú.'); return
     state=STATE.setdefault(chat_id, {})
     if t.upper() == 'AHORA':
         selected=state.get('_active')
@@ -731,11 +846,14 @@ def handle(chat_id,text):
         fresh=sources.refresh(selected)
         if fresh is None:
             send(chat_id,'⚠️ No pude actualizar el partido seleccionado. No hay una lectura LIVE nueva.'); return
-        choose(chat_id,fresh); return
+        choose(chat_id,fresh,refresh=False); return
     if t.isdigit() and state.get('_options'):
         i=int(t)-1; opts=state['_options']
         if 0<=i<len(opts): choose(chat_id,opts[i]); return
         send(chat_id,'Ese número no corresponde a la lista actual.'); return
+    if t.isdigit():
+        send(chat_id,'No hay una lista pendiente. Escribe el equipo para mostrar las opciones.'); return
+    state.pop('_options',None)
     d,rows=today_catalog()
     if d.get('errors'):
         send(chat_id,'⚠️ No pude consultar las fuentes de partidos. Esto no significa que el encuentro no exista.'); return
@@ -744,7 +862,6 @@ def handle(chat_id,text):
     if not matches: matches=sources.search_extra(t)
     if not matches:
         send(chat_id,'No pude confirmar ese encuentro de HOY en las fuentes disponibles. Puede faltar cobertura o estar registrado en otra categoría. El partido no se da por inexistente.'); return
-    if len(matches)==1: choose(chat_id,matches[0]); return
     state['_options']=matches
     lines=['🏐 Coincidencias de HOY']
     for i,m in enumerate(matches,1):

@@ -1,10 +1,453 @@
+# BOTS VÓLEY V1.06 — aplicación autónoma.
+# Las fuentes van incluidas en este archivo, sin imports de archivos locales.
+# Se preservan espacios de nombres independientes para evitar colisiones.
+import sys as _sys
+import types as _types
+
+_embedded_official = r'''
+"""Calendarios oficiales verificados, no noticias ni partidos inyectados.
+Registro por competición: URL, año y huso de sede comprobados.
+"""
+from html.parser import HTMLParser
+from datetime import datetime, timezone, timedelta
+from urllib.request import Request, urlopen
+import time
+import logging
+
+URL = ('https://norceca.net/2026%20Competition%20&%20Activities/Pan%20American%20Cups/'
+       'Women%20Pan%20American%20Cup/Calendar/Calendar-Senior%20Women%E2%80%99s%20Pan%20American%20Cup.htm')
+TOURNAMENTS = [{'key':'panam-women-2026','url':URL,'year':2026,
+                'name':'NORCECA Pan American Cup Women 2026', 'offset':-6}]
+CACHE={}
+MONTHS={m:i for i,m in enumerate(['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'],1)}
+
+class Table(HTMLParser):
+    def __init__(self):
+        super().__init__();self.rows=[];self.cells=[];self.cell=None
+    def handle_starttag(self,tag,attrs):
+        if tag=='tr':self.cells=[]
+        if tag in ('td','th'):self.cell=[]
+    def handle_data(self,data):
+        if self.cell is not None:self.cell.append(data)
+    def handle_endtag(self,tag):
+        if tag in ('td','th') and self.cell is not None:
+            self.cells.append(' '.join(' '.join(self.cell).split()));self.cell=None
+        if tag=='tr' and self.cells:self.rows.append(self.cells)
+
+
+def parse_norceca(html, config, now=None):
+    import catalog as c
+    import re
+    now = time.time() if now is None else now
+    table=Table();table.feed(html);matches=[]
+    for row in table.rows:
+        if len(row)<14 or not row[0].isdigit():continue
+        try:
+            d,mon=row[1].split('-');hour,minute=map(int,row[2].split(':'))
+            ts=int(datetime(config['year'],MONTHS[mon.lower()[:3]],int(d),hour,minute,
+                            tzinfo=timezone(timedelta(hours=config['offset']))).timestamp())
+        except (ValueError,KeyError):continue
+        home,away=row[4],row[6]
+        if not home or not away or any(re.search(r'\b(winner|loser|tbd|ganador|perdedor)\b',x.lower()) for x in [home,away]):continue
+        # The 'LIVE' column is only a hyperlink present even for completed games.
+        score=re.fullmatch(r'([0-3])-([0-3])',row[8])
+        hs,aws=map(int,score.groups()) if score else (None,None)
+        final=hs is not None and max(hs,aws)==3 and min(hs,aws)<3
+        state='FT' if final else 'NS' if ts>now else 'UNKNOWN'
+        m=c.make_match('norceca',config['key']+'-'+row[0],ts,home,away,config['name'],state,
+                       {'home':hs,'away':aws} if final else {})
+        if not m:continue
+        m['_official_url']=config['url'];m['_tournament_key']=config['key']
+        m['_best_of']=5
+        # Reject contradictory summaries; do not use these rows to fit a model.
+        sets=[]
+        for cell in row[9:14]:
+            v=re.fullmatch(r'(\d+)-(\d+)',cell)
+            if v and max(map(int,v.groups()))>0:sets.append(tuple(map(int,v.groups())))
+        wins=[0,0];valid=True
+        for n,(a,b) in enumerate(sets):
+            target=15 if n==4 else 25
+            if max(a,b)<target or abs(a-b)<2 or (max(a,b)>target and abs(a-b)!=2):valid=False
+            wins[int(b>a)]+=1
+        if final and (not valid or wins!=[hs,aws]):
+            m['scores']={};m['_data_issue']='Marcador oficial contradictorio; pendiente de comprobar.'
+        matches.append(m)
+    return matches
+
+
+def calendar(force=False):
+    out=[];reasons=[]
+    for cfg in TOURNAMENTS:
+        key=cfg['key'];cached=CACHE.get(key)
+        if not force and cached and time.time()-cached[0]<cached[3]:
+            out.extend(cached[1]);reasons.append(cached[2]);continue
+        try:
+            req=Request(cfg['url'],headers={'User-Agent':'BOTS-VOLEY/1.06'})
+            with urlopen(req,timeout=8) as response:
+                raw=response.read(2_000_000)
+            try:html=raw.decode('utf-8')
+            except UnicodeDecodeError:html=raw.decode('cp1252')
+            rows=parse_norceca(html,cfg)
+            if not rows:raise ValueError('calendario no reconocido')
+            reason='ok';ttl=120
+        except Exception as exc:
+            rows=[];reason=type(exc).__name__;ttl=30
+            logging.getLogger('voley.official').warning('NORCECA: %s',reason)
+        CACHE[key]=(time.time(),rows,reason,ttl)
+        out.extend(rows);reasons.append(reason)
+    return out,reasons
+
+'''
+
+_embedded_catalog = r'''
+"""Catálogo multifuente de vóley. Adaptado del orquestador V9.70 de fútbol.
+Los IDs nunca se intercambian entre proveedores. Sin cuotas ni fechas inventadas.
+"""
+import os
+import re
+import json
+import time
+import logging
+import unicodedata
+import threading
+from datetime import datetime, timezone, timedelta
+from difflib import SequenceMatcher
+from concurrent.futures import ThreadPoolExecutor
+from urllib.request import Request, urlopen
+from urllib.parse import urlencode, quote
+import official
+
+LIMA = timezone(timedelta(hours=-5))
+LOG = logging.getLogger('voley.catalog')
+TIMEOUT = max(2, min(12, float(os.getenv('SOURCE_TIMEOUT', '6'))))
+CACHE = {}
+LOCK = threading.Lock()
+POOL = ThreadPoolExecutor(max_workers=8)
+
+
+def norm(s):
+    s = unicodedata.normalize('NFKD', str(s or '')).encode('ascii', 'ignore').decode().lower()
+    return ' '.join(re.findall(r'[a-z0-9]+', s))
+
+
+ALIASES = {
+    'usa': ['eeuu', 'ee uu', 'estados unidos', 'united states', 'united states of america', 'eua'],
+    'dominican republic': ['republica dominicana', 'rep dominicana', 'dominicana', 'republica dominca', 'republicia dominca', 'republcia dominca', 'dom'],
+    'brazil': ['brasil'], 'germany': ['alemania'], 'poland': ['polonia'],
+    'italy': ['italia'], 'japan': ['japon'], 'netherlands': ['paises bajos', 'holanda'],
+    'turkey': ['turquia', 'turkiye'], 'south korea': ['corea del sur', 'korea republic'],
+    'france': ['francia'], 'spain': ['espana'], 'belgium': ['belgica'],
+    'czech republic': ['chequia', 'czechia'], 'latvia': ['letonia'],
+    'puerto rico': ['p rico'], 'argentina': ['arg'], 'canada': ['can'],
+}
+REPLACEMENTS = sorted([(a, k) for k, arr in ALIASES.items() for a in arr], key=lambda x: -len(x[0]))
+
+
+def canonical(s):
+    s = norm(s)
+    for a, k in REPLACEMENTS:
+        s = re.sub(r'(?<!\w)' + re.escape(a) + r'(?!\w)', k, s)
+    s = re.sub(r'\b(women|womens|femenino|femenina|femenil|damas)\b', 'women', s)
+    s = re.sub(r'\b(men|mens|masculino|masculina|varones)\b', 'men', s)
+    s = re.sub(r'\bsub\s*(\d{2})\b', r'u\1', s)
+    s = re.sub(r'\b(w|f)$', 'women', s)
+    return ' '.join(w for w in s.split() if w not in {'volleyball', 'voleyball', 'voley', 'voleibol'})
+
+
+def category(s):
+    s = canonical(s)
+    gender = 'women' if 'women' in s.split() else 'men' if 'men' in s.split() else ''
+    age = re.search(r'\bu\d{2}\b', s)
+    return gender, age.group() if age else '', 'beach' if re.search(r'\b(beach|playa)\b', s) else ''
+
+
+def name_score(q, name):
+    q, name = canonical(q), canonical(name)
+    if not q or not name:
+        return 0.0
+    qc, nc = category(q), category(name)
+    if any(a and a != b for a, b in zip(qc, nc)):
+        return 0.0
+    if q == name or (' ' + q + ' ') in (' ' + name + ' '):
+        return 1.0
+    qw, nw = q.split(), name.split()
+    scores = []
+    for w in qw:
+        best = max((SequenceMatcher(None, w, v).ratio() if len(w) >= 4 and w[:2] == v[:2] else float(w == v) for v in nw), default=0)
+        scores.append(best)
+    return min(scores) if scores else 0.0
+
+
+def query_parts(q):
+    q = norm(q)
+    q = re.sub(r'\b(vs|versus|contra|frente a|y)\b', ' | ', q)
+    q = re.sub(r'\b(hoy|juega|juegan|juego|partido|partidos|analiza|analizar|analisis|el|entre|ahora)\b', ' ', q)
+    return [canonical(p) for p in q.split('|') if canonical(p)]
+
+
+def find_matches(query, rows):
+    parts = query_parts(query)
+    if not parts or len(parts) > 2:
+        return []
+    ranked = []
+    for m in rows:
+        h, a = m['teams']['home']['name'], m['teams']['away']['name']
+        # Category can be carried by the tournament rather than team name.
+        cat = ' '.join(category((m.get('league') or {}).get('name', '')))
+        h, a = h + ' ' + cat, a + ' ' + cat
+        if len(parts) == 2:
+            score = max(min(name_score(parts[0], h), name_score(parts[1], a)), min(name_score(parts[0], a), name_score(parts[1], h)))
+        else:
+            score = max(name_score(parts[0], h), name_score(parts[0], a))
+        if score >= .76:
+            ranked.append((score, m))
+    ranked.sort(key=lambda x: (-x[0], x[1]['timestamp']))
+    return [m for _, m in ranked[:30]]
+
+
+def timestamp(raw):
+    try:
+        if isinstance(raw, (int, float)):
+            return int(raw)
+        dt = datetime.fromisoformat(str(raw).replace('Z', '+00:00'))
+        if not dt.tzinfo:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
+def day_of(m):
+    try:
+        return datetime.fromtimestamp(m['timestamp'], LIMA).date().isoformat()
+    except (KeyError, ValueError, TypeError, OverflowError):
+        return None
+
+
+def integer(v):
+    try:
+        return int(v) if v is not None else None
+    except (ValueError, TypeError):
+        return None
+
+
+def status(value):
+    s = str(value or '').upper()
+    if s in {'FINISHED', 'FT', 'ENDED', 'AOT'}:
+        return 'FT'
+    if s in {'INPROGRESS', 'LIVE', 'IN_PLAY', 'INPLAY', '1S', '2S', '3S', '4S', '5S', 'S1', 'S2', 'S3', 'S4', 'S5'}:
+        return s if s.endswith('S') else 'LIVE'
+    if s in {'CANCELED', 'CANCELLED', 'CANC'}:
+        return 'CANC'
+    if s in {'POSTPONED', 'PST'}:
+        return 'PST'
+    if s in {'INT', 'INTERRUPTED', 'SUSP', 'SUSPENDED'}:
+        return 'SUSP'
+    if s in {'NS', 'NOTSTARTED', 'SCHEDULED'}:
+        return 'NS'
+    return 'UNKNOWN'
+
+
+def make_match(source, eid, ts, home, away, league, state, scores=None, team_ids=None, league_id=None, season=None, points=None):
+    ts = timestamp(ts)
+    if not eid or not ts or not home or not away:
+        return None
+    tids = team_ids or (None, None)
+    return {'id': f'{source}:{eid}', '_source': source, '_source_id': str(eid),
+            'timestamp': ts, 'date': datetime.fromtimestamp(ts, timezone.utc).isoformat(),
+            'teams': {'home': {'id': tids[0], 'name': home}, 'away': {'id': tids[1], 'name': away}},
+            'league': {'id': league_id, 'name': league or 'Competición', 'season': season},
+            'status': {'short': status(state)}, 'scores': scores or {}, 'points': points or {},
+            '_fetched_at': time.time()}
+
+
+def parse_api(data):
+    out = []
+    for e in data.get('response') or []:
+        try:
+            h, a = e['teams']['home'], e['teams']['away']; lg = e.get('league') or {}
+            m = make_match('api', e['id'], e.get('timestamp') or e.get('date'), h['name'], a['name'], lg.get('name'), (e.get('status') or {}).get('short'), e.get('scores'), (h.get('id'), a.get('id')), lg.get('id'), lg.get('season'))
+            if m:
+                # Points are distinct from match sets; period data must stay explicit.
+                m['points'] = e.get('points') or {}; out.append(m)
+        except (KeyError, TypeError, AttributeError):
+            continue
+    return out
+
+
+def parse_sportsdb(data):
+    out = []
+    for e in data.get('events') or []:
+        if norm(e.get('strSport')) != 'volleyball':
+            continue
+        raw = e.get('strTimestamp')
+        if not raw and e.get('dateEvent') and e.get('strTime'):
+            raw = e['dateEvent'] + 'T' + e['strTime']
+        m = make_match('sportsdb', e.get('idEvent'), raw, e.get('strHomeTeam'), e.get('strAwayTeam'), e.get('strLeague'), 'PST' if e.get('strPostponed') == 'yes' else e.get('strStatus'), {'home': integer(e.get('intHomeScore')), 'away': integer(e.get('intAwayScore'))}, (e.get('idHomeTeam'), e.get('idAwayTeam')), e.get('idLeague'), e.get('strSeason'))
+        if m:
+            out.append(m)
+    return out
+
+
+def parse_sofa(data):
+    out = []
+    for e in data.get('events') or []:
+        try:
+            tour = e.get('tournament') or {}; sport = ((tour.get('category') or {}).get('sport') or {}).get('slug')
+            if sport and sport != 'volleyball':
+                continue
+            h, a = e['homeTeam'], e['awayTeam']
+            hs, aws = e.get('homeScore') or {}, e.get('awayScore') or {}
+            # Sofa current/display is sets for volleyball; periodN carries points.
+            m = make_match('sofa', e['id'], e.get('startTimestamp'), h['name'], a['name'], tour.get('name'), (e.get('status') or {}).get('type'), {'home': hs.get('current'), 'away': aws.get('current')}, (h.get('id'), a.get('id')), tour.get('id'))
+            if m:
+                for n in range(5, 0, -1):
+                    if hs.get(f'period{n}') is not None and aws.get(f'period{n}') is not None:
+                        m['points'] = {'home': hs[f'period{n}'], 'away': aws[f'period{n}']}; break
+                out.append(m)
+        except (KeyError, TypeError, AttributeError):
+            continue
+    return out
+
+
+def fetch(source, url, parser, headers=None, force=False):
+    now = time.time()
+    with LOCK:
+        cached = CACHE.get(url)
+        if not force and cached and now - cached[0] < cached[3]:
+            return cached[1], cached[2]
+    try:
+        req = Request(url, headers={'User-Agent': 'BOTS-VOLEY/1.06', 'Accept': 'application/json', **(headers or {})})
+        with urlopen(req, timeout=TIMEOUT) as r:
+            data = json.loads(r.read(8_000_000).decode('utf-8'))
+        if not isinstance(data, dict) or data.get('errors'):
+            raise ValueError('respuesta inválida o error del proveedor')
+        expected = 'response' if source == 'api' else 'events'
+        if expected not in data or (data[expected] is not None and not isinstance(data[expected], list)):
+            raise ValueError('formato de catálogo no reconocido')
+        rows, reason, ttl = parser(data), 'ok', (1800 if source == 'api' else 300)
+    except Exception as exc:
+        # No URLs/credentials in logs; failures never become a confirmed empty calendar.
+        rows, reason, ttl = [], type(exc).__name__, 60
+        LOG.warning('Fuente %s no disponible: %s', source, reason)
+    with LOCK:
+        CACHE[url] = (now, rows, reason, ttl)
+    return rows, reason
+
+
+def dedupe(rows):
+    # Conservative cross-source merge: same category AND named competition AND
+    # ordered participants/time. Ambiguous competitions remain separate options.
+    out, seen = [], {}
+    for m in sorted(rows, key=lambda x: (x['_source'] != 'api', x['_source'] != 'sofa')):
+        h, a = m['teams']['home']['name'], m['teams']['away']['name']
+        k = (canonical(h), canonical(a), canonical(m['league']['name']), m['timestamp'])
+        if k in seen:
+            base = seen[k]
+            base.setdefault('_references', {})[m['_source']] = m['_source_id']
+            continue
+        m = dict(m); m['_references'] = {m['_source']: m['_source_id']}
+        seen[k] = m; out.append(m)
+    return sorted(out, key=lambda x: (x['timestamp'], x['id']))
+
+
+def catalog(day=None):
+    day = day or datetime.now(LIMA).date().isoformat()
+    # A Lima day intersects two UTC dates. Fetch both, then filter real timestamps.
+    dates = [day, (datetime.fromisoformat(day) + timedelta(days=1)).date().isoformat()]
+    jobs = []
+    api_key = os.getenv('VOLLEY_API_KEY', '').strip()
+    for d in dates:
+        if api_key:
+            base = os.getenv('VOLLEY_API_BASE', 'https://v1.volleyball.api-sports.io').rstrip('/')
+            jobs.append(('api', f'{base}/games?{urlencode({"date": d})}', parse_api, {'x-apisports-key': api_key}))
+        key = quote(os.getenv('SPORTSDB_API_KEY', '123'), safe='')
+        jobs.append(('sportsdb', f'https://www.thesportsdb.com/api/v1/json/{key}/eventsday.php?{urlencode({"d": d, "s": "Volleyball"})}', parse_sportsdb, None))
+        if os.getenv('ENABLE_SOFASCORE', '1') == '1':
+            jobs.append(('sofa', f'https://www.sofascore.com/api/v1/sport/volleyball/scheduled-events/{d}', parse_sofa, None))
+    official_future = POOL.submit(official.calendar)
+    futures = [(j[0], POOL.submit(fetch, *j)) for j in jobs]
+    rows, meta = [], {}
+    for src, f in futures:
+        batch, reason = f.result()
+        rows.extend(m for m in batch if day_of(m) == day)
+        meta.setdefault(src, []).append(reason)
+    official_rows, official_reasons = official_future.result()
+    rows.extend(m for m in official_rows if day_of(m) == day)
+    meta['norceca'] = official_reasons
+    return dedupe(rows), meta
+
+
+def refresh(m):
+    src, eid = m['_source'], m['_source_id']
+    if src == 'norceca':
+        rows, reasons = official.calendar(force=True)
+        return next((x for x in rows if x['id'] == m['id']), None)
+    if src == 'api':
+        key = os.getenv('VOLLEY_API_KEY', '').strip()
+        base = os.getenv('VOLLEY_API_BASE', 'https://v1.volleyball.api-sports.io').rstrip('/')
+        rows, reason = fetch(src, f'{base}/games?{urlencode({"id": eid})}', parse_api, {'x-apisports-key': key}, force=True)
+    elif src == 'sportsdb':
+        key = quote(os.getenv('SPORTSDB_API_KEY', '123'), safe='')
+        rows, reason = fetch(src, f'https://www.thesportsdb.com/api/v1/json/{key}/lookupevent.php?{urlencode({"id": eid})}', parse_sportsdb, force=True)
+    elif src == 'sofa':
+        # fetch expects events; use the date endpoint with cache bypass, preserving ID.
+        utc_day = datetime.fromtimestamp(m['timestamp'], timezone.utc).date().isoformat()
+        rows, reason = fetch(src, f'https://www.sofascore.com/api/v1/sport/volleyball/scheduled-events/{utc_day}', parse_sofa, force=True)
+    else:
+        return None
+    return next((x for x in rows if x['id'] == m['id']), None)
+
+
+def search_extra(query, day=None):
+    """Búsqueda dirigida cuando el calendario omite el encuentro; mismo filtro de identidad."""
+    day = day or datetime.now(LIMA).date().isoformat()
+    parts = query_parts(query)
+    if not parts: return []
+    dates = [day, (datetime.fromisoformat(day) + timedelta(days=1)).date().isoformat()]
+    futures = []
+    key = quote(os.getenv('SPORTSDB_API_KEY', '123'), safe='')
+    search_term = '_vs_'.join(parts) if len(parts) == 2 else parts[0]
+    for d in dates:
+        url = f'https://www.thesportsdb.com/api/v1/json/{key}/searchevents.php?{urlencode({"e": search_term, "d": d})}'
+        futures.append(POOL.submit(fetch, 'sportsdb', url, parse_sportsdb))
+    api_key = os.getenv('VOLLEY_API_KEY', '').strip()
+    if api_key:
+        base = os.getenv('VOLLEY_API_BASE', 'https://v1.volleyball.api-sports.io').rstrip('/')
+        term = parts[0]
+        def parse_teams(d):
+            out=[]
+            for raw in d.get('response') or []:
+                tm=raw.get('team') if isinstance(raw.get('team'),dict) else raw
+                if tm.get('id') and name_score(term,tm.get('name')) >= .76: out.append(tm)
+            return out
+        candidates, reason = fetch('api', f'{base}/teams?{urlencode({"search":term})}', parse_teams, {'x-apisports-key':api_key})
+        for tm in candidates[:2]:
+            for d in dates:
+                futures.append(POOL.submit(fetch,'api',f'{base}/games?{urlencode({"date":d,"team":tm["id"]})}',parse_api,{'x-apisports-key':api_key}))
+    rows=[]
+    for future in futures:
+        batch,_=future.result()
+        rows.extend(m for m in batch if day_of(m)==day)
+    return find_matches(query, dedupe(rows))
+
+'''
+
+# Ambos módulos se registran antes de inicializarlos (referencia circular diferida).
+_official = _types.ModuleType('official')
+sources = _types.ModuleType('catalog')
+_sys.modules['official'] = _official
+_sys.modules['catalog'] = sources
+exec(compile(_embedded_official, '<bot:official>', 'exec'), _official.__dict__)
+exec(compile(_embedded_catalog, '<bot:catalog>', 'exec'), sources.__dict__)
+del _embedded_official, _embedded_catalog
+
 import os, math, json, time, logging, re, unicodedata
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlencode
 from urllib.request import urlopen, Request
 
-VERSION = "1.05"
-import catalog as sources
+VERSION = "1.06"
 LIMA = timezone(timedelta(hours=-5))
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 VOLLEY_API_KEY = os.getenv("VOLLEY_API_KEY", "").strip()
@@ -279,7 +722,7 @@ def handle(chat_id,text):
     t=(text or '').strip()
     if not t: return
     if t.lower() in {'/start','start','inicio'}:
-        send(chat_id, '🏐 BOTS VÓLEY V1.05\nEscribe los equipos, PARTIDOS DE HOY o AHORA.\nBúsqueda multifuente con horario de Perú.'); return
+        send(chat_id, '🏐 BOTS VÓLEY V1.06\nEscribe los equipos, PARTIDOS DE HOY o AHORA.\nBúsqueda multifuente con horario de Perú.'); return
     state=STATE.setdefault(chat_id, {})
     if t.upper() == 'AHORA':
         selected=state.get('_active')

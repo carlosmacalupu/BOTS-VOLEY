@@ -3,7 +3,7 @@ from datetime import datetime, timezone, timedelta
 from urllib.parse import urlencode
 from urllib.request import urlopen, Request
 
-VERSION = "1.04"
+VERSION = "1.05"
 import catalog as sources
 LIMA = timezone(timedelta(hours=-5))
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -56,6 +56,7 @@ def send(chat_id,text):
             current += part+'\n'
     if current: chunks.append(current.rstrip())
     for chunk in chunks:
+        chunk = f'🏐 V{VERSION} · MULTIFUENTE\n' + chunk
         try: tg('sendMessage',chat_id=chat_id,text=chunk)
         except Exception as e: log.error('Telegram send: %s',type(e).__name__)
 
@@ -109,7 +110,7 @@ def list_catalog(chat_id, catalog):
     STATE.setdefault(chat_id,{})['_options']=shown
     lines=[f'🏐 VÓLEY DE HOY · {len(catalog)} encuentros disponibles']
     for i,m in enumerate(shown,1):
-        h,a=names(m); lines.append(f'{i}. {h} vs {a} · {kickoff_text(m)} · {league_text(m)}')
+        h,a=names(m); lines.append(f'{i}. {h} vs {a} · {datetime.fromtimestamp(m["timestamp"],LIMA).strftime("%d/%m")} · {kickoff_text(m)} · {league_text(m)}')
     if len(catalog)>30: lines.append('Escribe un equipo para filtrar el resto del catálogo.')
     lines.append('Responde con el número o escribe un equipo.')
     send(chat_id,'\n'.join(lines))
@@ -234,16 +235,17 @@ def set_distribution(ph):
 
 def render(m):
     hn,an=names(m); st=status_short(m)
-    lines=[f'🏐 BOTS VÓLEY — V{VERSION}',f'{hn} vs {an}',f'🏆 {league_text(m)}',f'🕒 {kickoff_text(m)}']
+    lines=[f'🏐 BOTS VÓLEY — V{VERSION}',f'{hn} vs {an}',f'🏆 {league_text(m)}',f'📅 {datetime.fromtimestamp(m["timestamp"],LIMA).strftime("%d/%m/%Y")} · {kickoff_text(m)}']
     if st in {'FT','CANC','PST','SUSP'}:
         label={'FT':'FINALIZADO','CANC':'CANCELADO','PST':'APLAZADO','SUSP':'SUSPENDIDO'}[st]
         lines.append(label)
         scores=m.get('scores') or {}
         if st=='FT' and scores.get('home') is not None and scores.get('away') is not None:
             lines.append(f"Sets: {scores['home']}-{scores['away']}")
+        if m.get('_data_issue'): lines.append(m['_data_issue'])
         lines.append('Sin propuestas activas.'); return '\n'.join(lines)
     if st=='UNKNOWN':
-        lines += ['Estado del partido sin confirmar.', 'Sin propuesta hasta confirmar el estado.']
+        lines += ['Encuentro localizado. Estado y marcador actuales sin confirmar.', 'Sin propuesta hasta confirmar el estado.']
         return '\n'.join(lines)
     if is_live(m):
         sc=m.get('scores') or {}
@@ -277,7 +279,7 @@ def handle(chat_id,text):
     t=(text or '').strip()
     if not t: return
     if t.lower() in {'/start','start','inicio'}:
-        send(chat_id, '🏐 BOTS VÓLEY V1.04\nEscribe los equipos, PARTIDOS DE HOY o AHORA.\nBúsqueda multifuente con horario de Perú.'); return
+        send(chat_id, '🏐 BOTS VÓLEY V1.05\nEscribe los equipos, PARTIDOS DE HOY o AHORA.\nBúsqueda multifuente con horario de Perú.'); return
     state=STATE.setdefault(chat_id, {})
     if t.upper() == 'AHORA':
         selected=state.get('_active')
@@ -303,7 +305,7 @@ def handle(chat_id,text):
     state['_options']=matches
     lines=['🏐 Coincidencias de HOY']
     for i,m in enumerate(matches,1):
-        h,a=names(m); lines.append(f'{i}. {h} vs {a} · {kickoff_text(m)} · {league_text(m)}')
+        h,a=names(m); lines.append(f'{i}. {h} vs {a} · {datetime.fromtimestamp(m["timestamp"],LIMA).strftime("%d/%m")} · {kickoff_text(m)} · {league_text(m)}')
     lines.append('Responde con el número.')
     send(chat_id,'\n'.join(lines))
 

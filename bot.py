@@ -3,7 +3,7 @@ from datetime import datetime, timezone, timedelta
 from urllib.parse import urlencode
 from urllib.request import urlopen, Request
 
-VERSION = "1.01"
+VERSION = "1.02"
 LIMA = timezone(timedelta(hours=-5))
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 VOLLEY_API_KEY = os.getenv("VOLLEY_API_KEY", "").strip()
@@ -16,24 +16,28 @@ STATE, CACHE = {}, {}
 
 
 def http_json(url, headers=None, timeout=20):
-    h={"User-Agent":"BOTS-VOLEY/1.01"}; h.update(headers or {})
+    h={"User-Agent":"BOTS-VOLEY/1.02"}; h.update(headers or {})
     with urlopen(Request(url, headers=h), timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8"))
 
 
 def api(path, cache_seconds=600, **params):
     if not VOLLEY_API_KEY:
-        return {"response":[], "errors":{"key":"VOLLEY_API_KEY no configurada"}}
+        return {"response":[], "errors":{"key":"VOLLEY_API_KEY no configurada"}, "_ok":False}
     url=f"{VOLLEY_BASE}/{path.lstrip('/')}"
     if params: url += "?" + urlencode(params)
     key=url; now=time.time()
-    if key in CACHE and now-CACHE[key][0] < cache_seconds: return CACHE[key][1]
+    if key in CACHE and now-CACHE[key][0] < cache_seconds:
+        return CACHE[key][1]
     try:
         data=http_json(url, {"x-apisports-key":VOLLEY_API_KEY})
+        if not isinstance(data,dict): data={"response":[],"errors":{"format":"respuesta no JSON-object"}}
+        data["_ok"] = not bool(data.get("errors"))
+        log.info("API %s params=%s results=%s errors=%s", path, params, data.get("results"), data.get("errors") or "none")
         CACHE[key]=(now,data); return data
     except Exception as e:
-        log.error("API-SPORTS %s: %s", path, e)
-        return {"response":[],"errors":{"network":str(e)}}
+        log.exception("API-SPORTS %s params=%s", path, params)
+        return {"response":[],"errors":{"network":str(e)},"_ok":False}
 
 
 def tg(method, **params):
@@ -51,25 +55,62 @@ def norm(s):
     return " ".join(re.findall(r"[a-z0-9]+",s))
 
 
-def today_matches():
-    # Lima date is the user's operational day. One cached request serves all searches/AHORA.
+def today_catalog():
+    # API-SPORTS Volleyball: one global request for the Lima operational date.
+    # No league/country filter: we intentionally retain every competition returned by the provider.
     date=datetime.now(LIMA).strftime("%Y-%m-%d")
-    d=api("games",cache_seconds=300,date=date,timezone="America/Lima")
-    return d.get("response") or []
+    d=api("games",cache_seconds=300,date=date)
+    return d, (d.get("response") or [])
+
+
+def today_matches():
+    return today_catalog()[1]
 
 
 def teams(m): return (m.get("teams") or {}).get("home",{}),(m.get("teams") or {}).get("away",{})
 def names(m):
     h,a=teams(m); return h.get("name","Local"),a.get("name","Visita")
 
-def find_matches(q):
+
+def kickoff_text(m):
+    raw=m.get("date") or m.get("datetime")
+    if raw: return str(raw)[11:16] if len(str(raw))>=16 else str(raw)
+    ts=m.get("timestamp")
+    try: return datetime.fromtimestamp(int(ts),LIMA).strftime("%H:%M")
+    except Exception: return "hora ?"
+
+
+def league_text(m):
+    lg=m.get("league") or {}
+    return lg.get("name") or lg.get("country") or "Competición"
+
+
+def find_matches(q, catalog=None):
     toks=[x for x in norm(q).split() if len(x)>=2]; out=[]
-    for m in today_matches():
+    for m in (catalog if catalog is not None else today_matches()):
         h,a=names(m); n=norm(h+" "+a); score=sum(1 for t in toks if t in n)
         if toks and score: out.append((score,m))
-    out.sort(key=lambda x:(x[0],x[1].get("timestamp",0)),reverse=True)
-    return [m for _,m in out[:10]]
+    out.sort(key=lambda x:(x[0],-(x[1].get("timestamp") or 0)),reverse=True)
+    return [m for _,m in out[:20]]
 
+
+def is_catalog_command(t):
+    n=norm(t)
+    return n in {"partidos de hoy","partidos hoy","juegos de hoy","juegos hoy","encuentros de hoy","encuentros hoy","hoy","partidos"}
+
+
+def list_catalog(chat_id, catalog):
+    if not catalog:
+        send(chat_id,"🏐 No hay encuentros devueltos por API-SPORTS para la fecha de hoy en Lima.")
+        return
+    # Telegram limit: show first 30, but keep all options in state.
+    STATE[chat_id]={"_options":catalog}
+    lines=[f"🏐 VÓLEY DE HOY · {len(catalog)} encuentros en el catálogo API-SPORTS"]
+    for i,m in enumerate(catalog[:30],1):
+        h,a=names(m); lines.append(f"{i}. {h} vs {a} · {kickoff_text(m)} · {league_text(m)}")
+    if len(catalog)>30: lines.append(f"… y {len(catalog)-30} más. Escribe un equipo para filtrar.")
+    lines.append("Responde con el número o escribe un equipo.")
+    send(chat_id,"\n".join(lines))
 
 def recursive_team_rows(obj, team_id, found=None):
     found=found or []
@@ -151,24 +192,43 @@ def choose(chat_id,m): STATE[chat_id]=m; send(chat_id,render(m))
 def handle(chat_id,text):
     t=(text or "").strip()
     if not t:return
+    log.info("MSG chat=%s text=%r",chat_id,t[:120])
     if t.lower() in {"/start","start","inicio"}:
-        send(chat_id,"🏐 BOTS VÓLEY listo.\nEscribe uno o ambos equipos de un partido de HOY.\nAHORA = reanalizar el partido seleccionado."); return
+        send(chat_id,"🏐 BOTS VÓLEY listo.\n\n• PARTIDOS DE HOY = catálogo mundial disponible en API-SPORTS\n• Escribe un equipo = filtrar el catálogo de hoy\n• 1, 2, 3... = seleccionar\n• AHORA = reanalizar seleccionado"); return
+    if is_catalog_command(t):
+        d,catalog=today_catalog()
+        if d.get("errors"):
+            log.error("Catalog API error: %s",d.get("errors"))
+            send(chat_id,"⚠️ API-SPORTS respondió con un error al consultar el catálogo de hoy. Revisa Deploy Logs; no lo trataré como 'partido no encontrado'.")
+            return
+        log.info("CATALOG today count=%d",len(catalog))
+        list_catalog(chat_id,catalog); return
     if t.upper()=="AHORA":
         m=STATE.get(chat_id)
-        if not isinstance(m,dict) or m.get("_options"): send(chat_id,"No hay partido seleccionado. Escribe el nombre de un equipo."); return
-        mid=str(m.get("id")); fresh=next((x for x in today_matches() if str(x.get("id"))==mid),m)
+        if not isinstance(m,dict) or m.get("_options"):
+            send(chat_id,"No hay partido seleccionado. Escribe PARTIDOS DE HOY o el nombre de un equipo."); return
+        d,catalog=today_catalog()
+        if d.get("errors"):
+            send(chat_id,"⚠️ No pude actualizar AHORA por un error de API-SPORTS."); return
+        mid=str(m.get("id")); fresh=next((x for x in catalog if str(x.get("id"))==mid),m)
         STATE[chat_id]=fresh; send(chat_id,render(fresh)); return
     if t.isdigit() and isinstance(STATE.get(chat_id),dict) and STATE[chat_id].get("_options"):
         opts=STATE[chat_id]["_options"]; i=int(t)-1
         if 0<=i<len(opts): choose(chat_id,opts[i]); return
-    ms=find_matches(t)
-    if not ms: send(chat_id,"No encontré un partido de vóley de HOY con ese nombre. Prueba con uno de los equipos."); return
+        send(chat_id,"Ese número no corresponde a la lista actual."); return
+    d,catalog=today_catalog()
+    if d.get("errors"):
+        log.error("Search API error: %s",d.get("errors"))
+        send(chat_id,"⚠️ API-SPORTS respondió con un error. La búsqueda no se marcará como 'sin partido'. Revisa Deploy Logs."); return
+    ms=find_matches(t,catalog)
+    log.info("SEARCH query=%r catalog=%d matches=%d",t,len(catalog),len(ms))
+    if not ms:
+        send(chat_id,"No encontré ese equipo entre los encuentros de HOY que API-SPORTS tiene en su cobertura. Puedes escribir PARTIDOS DE HOY para ver el catálogo disponible."); return
     if len(ms)==1: choose(chat_id,ms[0]); return
-    STATE[chat_id]={"_options":ms}; lines=["🏐 Encontré estas opciones de HOY:"]
+    STATE[chat_id]={"_options":ms}; lines=[f"🏐 Coincidencias de HOY para: {t}"]
     for i,m in enumerate(ms,1):
-        h,a=names(m); lines.append(f"{i}. {h} vs {a}")
+        h,a=names(m); lines.append(f"{i}. {h} vs {a} · {kickoff_text(m)} · {league_text(m)}")
     lines.append("Responde solo con el número."); send(chat_id,"\n".join(lines))
-
 
 def main():
     if not TELEGRAM_TOKEN: raise SystemExit("Falta TELEGRAM_BOT_TOKEN")

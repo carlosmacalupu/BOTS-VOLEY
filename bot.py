@@ -3,7 +3,8 @@ from datetime import datetime, timezone, timedelta
 from urllib.parse import urlencode
 from urllib.request import urlopen, Request
 
-VERSION = "1.03"
+VERSION = "1.04"
+import catalog as sources
 LIMA = timezone(timedelta(hours=-5))
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 VOLLEY_API_KEY = os.getenv("VOLLEY_API_KEY", "").strip()
@@ -15,7 +16,7 @@ log = logging.getLogger("bots_voley")
 STATE, CACHE = {}, {}
 
 
-def http_json(url, headers=None, timeout=20):
+def http_json(url, headers=None, timeout=6):
     h={"User-Agent":"BOTS-VOLEY/1.03"}; h.update(headers or {})
     with urlopen(Request(url, headers=h), timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8"))
@@ -36,7 +37,7 @@ def api(path, cache_seconds=600, **params):
         log.info("API %s params=%s results=%s errors=%s", path, params, data.get("results"), data.get("errors") or "none")
         CACHE[key]=(now,data); return data
     except Exception as e:
-        log.exception("API-SPORTS %s params=%s", path, params)
+        log.warning("API-SPORTS %s no disponible (%s)", path, type(e).__name__)
         return {"response":[],"errors":{"network":str(e)},"_ok":False}
 
 
@@ -46,8 +47,17 @@ def tg(method, **params):
 
 
 def send(chat_id,text):
-    try: return tg("sendMessage",chat_id=chat_id,text=text)
-    except Exception as e: log.error("Telegram send: %s",e)
+    chunks=[]; current=''
+    for line in str(text).splitlines():
+        for pos in range(0,max(1,len(line)),3500):
+            part=line[pos:pos+3500]
+            if len(current)+len(part)+1>3800:
+                chunks.append(current);current=''
+            current += part+'\n'
+    if current: chunks.append(current.rstrip())
+    for chunk in chunks:
+        try: tg('sendMessage',chat_id=chat_id,text=chunk)
+        except Exception as e: log.error('Telegram send: %s',type(e).__name__)
 
 
 def norm(s):
@@ -56,11 +66,10 @@ def norm(s):
 
 
 def today_catalog():
-    # API-SPORTS Volleyball: one global request for the Lima operational date.
-    # No league/country filter: we intentionally retain every competition returned by the provider.
-    date=datetime.now(LIMA).strftime("%Y-%m-%d")
-    d=api("games",cache_seconds=300,date=date)
-    return d, (d.get("response") or [])
+    rows, meta = sources.catalog()
+    ok = any('ok' in reasons for reasons in meta.values())
+    return {'response': rows, 'errors': {} if ok else {'sources': 'sin fuentes disponibles'}, '_meta': meta}, rows
+
 
 
 def today_matches():
@@ -73,11 +82,9 @@ def names(m):
 
 
 def kickoff_text(m):
-    raw=m.get("date") or m.get("datetime")
-    if raw: return str(raw)[11:16] if len(str(raw))>=16 else str(raw)
-    ts=m.get("timestamp")
-    try: return datetime.fromtimestamp(int(ts),LIMA).strftime("%H:%M")
-    except Exception: return "hora ?"
+    try: return datetime.fromtimestamp(m['timestamp'], LIMA).strftime('%H:%M') + ' Perú'
+    except (KeyError, TypeError, ValueError): return 'hora sin confirmar'
+
 
 
 def league_text(m):
@@ -86,12 +93,8 @@ def league_text(m):
 
 
 def find_matches(q, catalog=None):
-    toks=[x for x in norm(q).split() if len(x)>=2]; out=[]
-    for m in (catalog if catalog is not None else today_matches()):
-        h,a=names(m); n=norm(h+" "+a); score=sum(1 for t in toks if t in n)
-        if toks and score: out.append((score,m))
-    out.sort(key=lambda x:(x[0],-(x[1].get("timestamp") or 0)),reverse=True)
-    return [m for _,m in out[:20]]
+    return sources.find_matches(q, catalog if catalog is not None else today_matches())
+
 
 
 def is_catalog_command(t):
@@ -101,29 +104,31 @@ def is_catalog_command(t):
 
 def list_catalog(chat_id, catalog):
     if not catalog:
-        send(chat_id,"🏐 No hay encuentros devueltos por API-SPORTS para la fecha de hoy en Lima.")
-        return
-    # Telegram limit: show first 30, but keep all options in state.
-    STATE[chat_id]={"_options":catalog}
-    lines=[f"🏐 VÓLEY DE HOY · {len(catalog)} encuentros en el catálogo API-SPORTS"]
-    for i,m in enumerate(catalog[:30],1):
-        h,a=names(m); lines.append(f"{i}. {h} vs {a} · {kickoff_text(m)} · {league_text(m)}")
-    if len(catalog)>30: lines.append(f"… y {len(catalog)-30} más. Escribe un equipo para filtrar.")
-    lines.append("Responde con el número o escribe un equipo.")
-    send(chat_id,"\n".join(lines))
+        send(chat_id,'🏐 Las fuentes consultadas no devolvieron encuentros confirmados para HOY en Perú.'); return
+    shown=catalog[:30]
+    STATE.setdefault(chat_id,{})['_options']=shown
+    lines=[f'🏐 VÓLEY DE HOY · {len(catalog)} encuentros disponibles']
+    for i,m in enumerate(shown,1):
+        h,a=names(m); lines.append(f'{i}. {h} vs {a} · {kickoff_text(m)} · {league_text(m)}')
+    if len(catalog)>30: lines.append('Escribe un equipo para filtrar el resto del catálogo.')
+    lines.append('Responde con el número o escribe un equipo.')
+    send(chat_id,'\n'.join(lines))
+
 
 def recursive_team_rows(obj, team_id, found=None):
-    found=found or []
-    if isinstance(obj,dict):
-        t=obj.get("team")
-        if isinstance(t,dict) and str(t.get("id"))==str(team_id): found.append(obj)
-        for v in obj.values(): recursive_team_rows(v,team_id,found)
-    elif isinstance(obj,list):
-        for v in obj: recursive_team_rows(v,team_id,found)
+    if found is None: found=[]
+    if isinstance(obj, dict):
+        t=obj.get('team')
+        if isinstance(t, dict) and str(t.get('id')) == str(team_id): found.append(obj)
+        for v in obj.values(): recursive_team_rows(v, team_id, found)
+    elif isinstance(obj, list):
+        for v in obj: recursive_team_rows(v, team_id, found)
     return found
 
 
+
 def standing_strength(m, team_id):
+    if m.get("_source") != "api": return None
     lg=m.get("league") or {}; league=lg.get("id"); season=lg.get("season")
     if not league or season is None or not team_id: return None
     d=api("standings",cache_seconds=3600,league=league,season=season)
@@ -135,6 +140,8 @@ def standing_strength(m, team_id):
     lose=g.get("lose") if isinstance(g,dict) else None
     if win is None: win=r.get("win") or r.get("wins")
     if lose is None: lose=r.get("lose") or r.get("losses")
+    if isinstance(win,dict): win=win.get("total")
+    if isinstance(lose,dict): lose=lose.get("total")
     try: played=int(played); win=int(win); lose=int(lose or 0)
     except Exception: return None
     if played<=0: return None
@@ -200,149 +207,111 @@ def match_lima_day(m, day):
     except Exception: return True
 
 
-def global_team_search(q):
-    """Fallback: resolve team IDs globally, then ask API-Sports for that team's games.
-    It is only used when the one-call daily catalog misses the user's team, protecting the 100/day plan.
-    """
-    day=datetime.now(LIMA).strftime("%Y-%m-%d")
-    n=norm(q); terms=[]
-    if len(n)>=3: terms.append(n)
-    # Useful fallback for 'Renata Sesi Bauru': try meaningful words, longest first.
-    words=sorted({w for w in n.split() if len(w)>=4 and w not in {"voley","volley","versus"}}, key=len, reverse=True)
-    terms.extend(w for w in words if w not in terms)
-    teams_found=[]; seen=set()
-    for term in terms[:3]:
-        d=api("teams",cache_seconds=86400,search=term)
-        if d.get("errors"):
-            log.warning("TEAM SEARCH error term=%r errors=%s",term,d.get("errors")); continue
-        for tm in extract_team_candidates(d):
-            tid=str(tm.get("id"))
-            if tid not in seen:
-                seen.add(tid); teams_found.append(tm)
-        if teams_found: break
-    if not teams_found: return [], "NO_TEAM"
-    games=[]; gids=set()
-    # Restrict calls: at most 4 team IDs. First query today's provider date.
-    for tm in teams_found[:4]:
-        d=api("games",cache_seconds=300,date=day,team=tm.get("id"))
-        if d.get("errors"):
-            log.warning("TEAM GAMES error team=%s errors=%s",tm.get("id"),d.get("errors")); continue
-        for g in d.get("response") or []:
-            gid=str(g.get("id"))
-            if gid not in gids and match_lima_day(g,day): gids.add(gid); games.append(g)
-    # Keep only games whose names overlap the original query; if one team was resolved, its games are valid candidates.
-    toks=[x for x in n.split() if len(x)>=3]
-    ranked=[]
-    for g in games:
-        h,a=names(g); hay=norm(h+" "+a); score=sum(1 for t in toks if t in hay)
-        ranked.append((score,g))
-    ranked.sort(key=lambda x:(x[0], x[1].get("timestamp") or 0), reverse=True)
-    return [g for _,g in ranked[:20]], "OK" if games else "NO_GAME"
+
 
 
 def live_points(m):
-    # Different competitions expose point data differently. Read only explicit values; never invent.
-    for key in ("points","scores"):
-        x=m.get(key)
-        if isinstance(x,dict):
-            h=x.get("home"); a=x.get("away")
-            if isinstance(h,(int,float)) and isinstance(a,(int,float)): return int(h),int(a)
-            cur=x.get("current")
-            if isinstance(cur,dict) and isinstance(cur.get("home"),(int,float)) and isinstance(cur.get("away"),(int,float)):
-                return int(cur["home"]),int(cur["away"])
+    x=m.get('points') or {}
+    h,a=x.get('home'),x.get('away')
+    if isinstance(h,(int,float)) and isinstance(a,(int,float)): return int(h),int(a)
     return None
 
 
+
 def set_distribution(ph):
-    # Coherent best-of-five approximation from a conservative set-strength transform.
-    # Used as exploratory test output, not calibrated betting advice.
-    ps=clamp(.5+(ph-.5)*.72,.18,.82); q=1-ps
-    probs={"3-0":ps**3,"3-1":3*ps**3*q,"3-2":6*ps**3*q*q,
-           "2-3":6*q**3*ps*ps,"1-3":3*q**3*ps,"0-3":q**3}
-    z=sum(probs.values()) or 1
-    return {k:v/z for k,v in probs.items()}
+    # Invert best-of-five match probability to a coherent iid set parameter.
+    low,high=0.,1.
+    for _ in range(60):
+        ps=(low+high)/2; q=1-ps
+        win=ps**3*(1+3*q+6*q*q)
+        if win < ph: low=ps
+        else: high=ps
+    ps=(low+high)/2; q=1-ps
+    return {'3-0':ps**3,'3-1':3*ps**3*q,'3-2':6*ps**3*q*q,
+            '2-3':6*q**3*ps*ps,'1-3':3*q**3*ps,'0-3':q**3}
+
 
 
 def render(m):
-    hn,an=names(m); model=pre_model(m); ph,pa=model["ph"],model["pa"]
-    live=is_live(m); scores=m.get("scores") or {}; winner=hn if ph>=pa else an; wp=max(ph,pa)
-    intu=intuition(wp,model["info"]); dist=set_distribution(ph)
-    lg=m.get("league") or {}; country=lg.get("country") or ""; comp=lg.get("name") or "Competición"
-    lines=[f"🏐 BOTS VÓLEY — V{VERSION}",f"{hn} vs {an}",f"🏆 {comp}" + (f" · {country}" if country else "")]
-    if live:
-        lines += [f"⏱ LIVE · Sets {scores.get('home','?')}-{scores.get('away','?')}"]
+    hn,an=names(m); st=status_short(m)
+    lines=[f'🏐 BOTS VÓLEY — V{VERSION}',f'{hn} vs {an}',f'🏆 {league_text(m)}',f'🕒 {kickoff_text(m)}']
+    if st in {'FT','CANC','PST','SUSP'}:
+        label={'FT':'FINALIZADO','CANC':'CANCELADO','PST':'APLAZADO','SUSP':'SUSPENDIDO'}[st]
+        lines.append(label)
+        scores=m.get('scores') or {}
+        if st=='FT' and scores.get('home') is not None and scores.get('away') is not None:
+            lines.append(f"Sets: {scores['home']}-{scores['away']}")
+        lines.append('Sin propuestas activas.'); return '\n'.join(lines)
+    if st=='UNKNOWN':
+        lines += ['Estado del partido sin confirmar.', 'Sin propuesta hasta confirmar el estado.']
+        return '\n'.join(lines)
+    if is_live(m):
+        sc=m.get('scores') or {}
+        lines += ['⏱ LIVE', f"Sets: {sc.get('home') if sc.get('home') is not None else '?'}-{sc.get('away') if sc.get('away') is not None else '?'}"]
         pts=live_points(m)
-        if pts: lines += [f"Set actual: {pts[0]}-{pts[1]}"]
-        lines += ["🧭 PRE → LIVE: el PRE sigue como base; el estado real solo ajusta cuando hay datos explícitos."]
-    else: lines += ["⏱ PRE"]
-    lines += ["", "🏆 GANADOR DEL PARTIDO", f"{hn}: {ph*100:.1f}%", f"{an}: {pa*100:.1f}%", f"Intuición: {intu}"]
-    lines += ["", "🎯 RESULTADO DE SETS (exploratorio)"]
-    for k in ("3-0","3-1","3-2","2-3","1-3","0-3"): lines.append(f"{k}: {dist[k]*100:.1f}%")
-    lines += ["", "🏐 GANADOR DEL SET", "NO DISPONIBLE con respaldo suficiente en esta versión."]
-    lines += ["", "📊 TOTAL DE PUNTOS", "NO DISPONIBLE si el proveedor no entrega datos suficientes; no se inventa una línea."]
-    lines += ["", "⚖️ HÁNDICAP DE PUNTOS/SETS", "NO DISPONIBLE con respaldo suficiente en esta versión."]
-    lines += ["", "📊 RESPALDO", f"Información: {'MEDIA' if model['info']>=60 else 'BAJA'} ({model['info']}%)"]
-    if model["hs"] and model["as"]:
-        lines += [f"Muestra de tabla: {min(model['hs']['n'],model['as']['n'])} partidos por lado como máximo comparable."]
-    else: lines += ["Historial/tabla insuficiente para una lectura fuerte."]
-    lines += ["", "🔥 APUESTAS DE PRUEBA"]
-    if model["info"]>=60 and wp>=.65:
-        lines += [f"1. Ganador del partido: {winner} — modelo {wp*100:.1f}%", "🟡 SOLO PRUEBA / REGISTRO. Aún no validado históricamente fuera de muestra."]
-    else:
-        lines += ["SIN PROPUESTA CONFIABLE.", "Registrar el partido sirve para calibrar; no se fuerza una apuesta."]
-    return "\n".join(lines)
+        if pts: lines.append(f'Puntos del último set informado: {pts[0]}-{pts[1]}')
+        lines += ['Probabilidades LIVE: todavía sin modelo validado.', 'SIN PROPUESTA CONFIABLE.']
+        return '\n'.join(lines)
+    lines.append('⏱ PRE')
+    model=pre_model(m)
+    if not model['hs'] or not model['as']:
+        lines += ['Respaldo estadístico: insuficiente.', 'Ganador: sin porcentaje sustentado.', 'Sets, puntos y hándicap: sin estimación sustentada.', 'SIN PROPUESTA CONFIABLE.']
+        return '\n'.join(lines)
+    ph=model['ph']; dist=set_distribution(ph)
+    lines += ['', '🏆 GANADOR · MODELO EXPLORATORIO', f'{hn}: {ph*100:.1f}%', f'{an}: {(1-ph)*100:.1f}%', 'Respaldo: clasificación de ambos equipos; sin calibración histórica.']
+    if 'beach' not in sources.category(league_text(m)) and 'playa' not in norm(league_text(m)):
+        lines += ['', '🎯 SETS · SUPUESTO AL MEJOR DE CINCO']
+        lines += [f'{k}: {v*100:.1f}%' for k,v in dist.items()]
+    lines += ['', 'Puntos y hándicap: sin estimación sustentada.', '🟡 SOLO PRUEBA / REGISTRO. Sin acierto validado.']
+    return '\n'.join(lines)
 
-def choose(chat_id,m): STATE[chat_id]=m; send(chat_id,render(m))
+
+def choose(chat_id,m):
+    state=STATE.setdefault(chat_id,{})
+    state['_active']=m
+    state.pop('_options',None)
+    send(chat_id,render(m))
+
 
 def handle(chat_id,text):
-    t=(text or "").strip()
-    if not t:return
-    log.info("MSG chat=%s text=%r",chat_id,t[:120])
-    if t.lower() in {"/start","start","inicio"}:
-        send(chat_id,"🏐 BOTS VÓLEY listo.\n\n• PARTIDOS DE HOY = catálogo mundial disponible en API-SPORTS\n• Escribe un equipo = buscar primero en el catálogo y luego por equipo en la cobertura mundial\n• 1, 2, 3... = seleccionar\n• AHORA = reanalizar seleccionado"); return
-    if is_catalog_command(t):
-        d,catalog=today_catalog()
-        if d.get("errors"):
-            log.error("Catalog API error: %s",d.get("errors"))
-            send(chat_id,"⚠️ API-SPORTS respondió con un error al consultar el catálogo de hoy. Revisa Deploy Logs; no lo trataré como 'partido no encontrado'.")
-            return
-        log.info("CATALOG today count=%d",len(catalog))
-        list_catalog(chat_id,catalog); return
-    if t.upper()=="AHORA":
-        m=STATE.get(chat_id)
-        if not isinstance(m,dict) or m.get("_options"):
-            send(chat_id,"No hay partido seleccionado. Escribe PARTIDOS DE HOY o el nombre de un equipo."); return
-        d,catalog=today_catalog()
-        if d.get("errors"):
-            send(chat_id,"⚠️ No pude actualizar AHORA por un error de API-SPORTS."); return
-        mid=str(m.get("id")); fresh=next((x for x in catalog if str(x.get("id"))==mid),m)
-        STATE[chat_id]=fresh; send(chat_id,render(fresh)); return
-    if t.isdigit() and isinstance(STATE.get(chat_id),dict) and STATE[chat_id].get("_options"):
-        opts=STATE[chat_id]["_options"]; i=int(t)-1
+    t=(text or '').strip()
+    if not t: return
+    if t.lower() in {'/start','start','inicio'}:
+        send(chat_id, '🏐 BOTS VÓLEY V1.04\nEscribe los equipos, PARTIDOS DE HOY o AHORA.\nBúsqueda multifuente con horario de Perú.'); return
+    state=STATE.setdefault(chat_id, {})
+    if t.upper() == 'AHORA':
+        selected=state.get('_active')
+        if not selected:
+            send(chat_id,'No hay partido seleccionado. Escribe un equipo.'); return
+        fresh=sources.refresh(selected)
+        if fresh is None:
+            send(chat_id,'⚠️ No pude actualizar el partido seleccionado. No hay una lectura LIVE nueva.'); return
+        choose(chat_id,fresh); return
+    if t.isdigit() and state.get('_options'):
+        i=int(t)-1; opts=state['_options']
         if 0<=i<len(opts): choose(chat_id,opts[i]); return
-        send(chat_id,"Ese número no corresponde a la lista actual."); return
-    d,catalog=today_catalog()
-    if d.get("errors"):
-        log.error("Search API error: %s",d.get("errors"))
-        send(chat_id,"⚠️ API-SPORTS respondió con un error. La búsqueda no se marcará como 'sin partido'. Revisa Deploy Logs."); return
-    ms=find_matches(t,catalog)
-    log.info("SEARCH query=%r catalog=%d matches=%d",t,len(catalog),len(ms))
-    if not ms:
-        log.info("SEARCH fallback_global query=%r",t)
-        ms,reason=global_team_search(t)
-        log.info("SEARCH fallback_global query=%r matches=%d reason=%s",t,len(ms),reason)
-    if not ms:
-        send(chat_id,"No pude vincular ese equipo con un encuentro de HOY en la cobertura disponible de API-SPORTS. Esto NO significa que el partido no exista. Prueba con el otro equipo o con ambos nombres: Equipo A vs Equipo B."); return
-    if len(ms)==1: choose(chat_id,ms[0]); return
-    STATE[chat_id]={"_options":ms}; lines=[f"🏐 Coincidencias de HOY para: {t}"]
-    for i,m in enumerate(ms,1):
-        h,a=names(m); lines.append(f"{i}. {h} vs {a} · {kickoff_text(m)} · {league_text(m)}")
-    lines.append("Responde solo con el número."); send(chat_id,"\n".join(lines))
+        send(chat_id,'Ese número no corresponde a la lista actual.'); return
+    d,rows=today_catalog()
+    if d.get('errors'):
+        send(chat_id,'⚠️ No pude consultar las fuentes de partidos. Esto no significa que el encuentro no exista.'); return
+    if is_catalog_command(t): list_catalog(chat_id, rows); return
+    matches=find_matches(t,rows)
+    if not matches: matches=sources.search_extra(t)
+    if not matches:
+        send(chat_id,'No pude confirmar ese encuentro de HOY en las fuentes disponibles. Puede faltar cobertura o estar registrado en otra categoría. El partido no se da por inexistente.'); return
+    if len(matches)==1: choose(chat_id,matches[0]); return
+    state['_options']=matches
+    lines=['🏐 Coincidencias de HOY']
+    for i,m in enumerate(matches,1):
+        h,a=names(m); lines.append(f'{i}. {h} vs {a} · {kickoff_text(m)} · {league_text(m)}')
+    lines.append('Responde con el número.')
+    send(chat_id,'\n'.join(lines))
+
 
 def main():
     if not TELEGRAM_TOKEN: raise SystemExit("Falta TELEGRAM_BOT_TOKEN")
-    if not VOLLEY_API_KEY: raise SystemExit("Falta VOLLEY_API_KEY")
-    log.info("BOTS VÓLEY V%s iniciado con API-SPORTS Volleyball",VERSION)
+    
+    log.info("BOTS VÓLEY V%s iniciado: catálogo multifuente", VERSION)
     offset=0
     while True:
         try:
@@ -351,7 +320,7 @@ def main():
                 offset=max(offset,u.get("update_id",0)+1); msg=u.get("message") or {}; cid=(msg.get("chat") or {}).get("id")
                 if cid and msg.get("text") is not None: handle(cid,msg.get("text"))
         except Exception as e:
-            log.exception("poll: %s",e); time.sleep(3)
+            log.error("poll: %s",type(e).__name__); time.sleep(3)
         time.sleep(POLL_SECONDS)
 
 if __name__=="__main__": main()

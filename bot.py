@@ -1,4 +1,4 @@
-# BOTS VÓLEY V1.08 — aplicación autónoma con fuentes, motor y GPT-5.
+# BOTS VÓLEY V1.08.1 — aplicación autónoma con fuentes, motor y GPT-5.
 import sys as _sys
 import types as _types
 
@@ -463,7 +463,7 @@ def catalog(day=None):
     # A Lima day intersects two UTC dates. Fetch both, then filter real timestamps.
     dates = [day, (datetime.fromisoformat(day) + timedelta(days=1)).date().isoformat()]
     jobs = []
-    api_key = os.getenv('VOLLEY_API_KEY', '').strip()
+    api_key = (os.getenv('VOLLEY_API_KEY', '').strip() or os.getenv('CLAVE_API_DE_VOLLEY', '').strip())
     for d in dates:
         if api_key:
             base = os.getenv('VOLLEY_API_BASE', 'https://v1.volleyball.api-sports.io').rstrip('/')
@@ -491,7 +491,7 @@ def refresh(m):
         rows, reasons = official.calendar(force=True)
         return next((x for x in rows if x['id'] == m['id']), None)
     if src == 'api':
-        key = os.getenv('VOLLEY_API_KEY', '').strip()
+        key = (os.getenv('VOLLEY_API_KEY', '').strip() or os.getenv('CLAVE_API_DE_VOLLEY', '').strip())
         base = os.getenv('VOLLEY_API_BASE', 'https://v1.volleyball.api-sports.io').rstrip('/')
         rows, reason = fetch(src, f'{base}/games?{urlencode({"id": eid})}', parse_api, {'x-apisports-key': key}, force=True)
     elif src == 'sportsdb':
@@ -518,7 +518,7 @@ def search_extra(query, day=None):
     for d in dates:
         url = f'https://www.thesportsdb.com/api/v1/json/{key}/searchevents.php?{urlencode({"e": search_term, "d": d})}'
         futures.append(POOL.submit(fetch, 'sportsdb', url, parse_sportsdb))
-    api_key = os.getenv('VOLLEY_API_KEY', '').strip()
+    api_key = (os.getenv('VOLLEY_API_KEY', '').strip() or os.getenv('CLAVE_API_DE_VOLLEY', '').strip())
     if api_key:
         base = os.getenv('VOLLEY_API_BASE', 'https://v1.volleyball.api-sports.io').rstrip('/')
         term = parts[0]
@@ -1099,7 +1099,7 @@ from datetime import datetime, timezone, timedelta
 from urllib.parse import urlencode
 from urllib.request import urlopen, Request
 
-VERSION = "1.08"
+VERSION = "1.08.1"
 import analysis_engine as engine
 from concurrent.futures import ThreadPoolExecutor
 WORKERS = ThreadPoolExecutor(max_workers=4)
@@ -1107,8 +1107,8 @@ PENDING = {}
 PENDING_LOCK = __import__("threading").Lock()
 import catalog as sources
 LIMA = timezone(timedelta(hours=-5))
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-VOLLEY_API_KEY = os.getenv("VOLLEY_API_KEY", "").strip()
+TELEGRAM_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN", "").strip() or os.getenv("TOKEN_BOT_DE_TELEGRAM", "").strip())
+VOLLEY_API_KEY = (os.getenv("VOLLEY_API_KEY", "").strip() or os.getenv("CLAVE_API_DE_VOLLEY", "").strip())
 VOLLEY_BASE = os.getenv("VOLLEY_API_BASE", "https://v1.volleyball.api-sports.io").rstrip("/")
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "2"))
 
@@ -1408,7 +1408,7 @@ def handle(chat_id,text):
     t=(text or '').strip()
     if not t: return
     if t.lower() in {'/start','start','inicio'}:
-        send(chat_id, '🏐 BOTS VÓLEY V1.08\nEscribe los equipos, PARTIDOS DE HOY o AHORA.\nBúsqueda multifuente con horario de Perú.'); return
+        send(chat_id, '🏐 BOTS VÓLEY V1.08.1\nEscribe los equipos, PARTIDOS DE HOY o AHORA.\nBúsqueda multifuente con horario de Perú.'); return
     state=STATE.setdefault(chat_id, {})
     set_query=re.search(r'\bset\s*([1-5])\b',norm(t))
     if set_query and state.get('_active') and len(norm(t).split())<=7:

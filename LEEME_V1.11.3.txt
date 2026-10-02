@@ -1,0 +1,29 @@
+BOTS VÓLEY V1.11.3 — CHATGPT SIEMPRE ANALIZA + WEB OPCIONAL + LIVE RÁPIDO
+
+CAMBIO PRINCIPAL
+- ChatGPT independiente ya NO depende de que la búsqueda web termine bien.
+- Después de reunir el expediente local, ChatGPT hace SIEMPRE una lectura independiente sin ver el porcentaje del BOT local.
+- En paralelo se intenta enriquecer con web. Si llega a tiempo, se fusiona; si falla o expira, la lectura independiente local se conserva.
+- Solo si OpenAI completo no está disponible (clave, cuota, autenticación o caída) puede quedar ChatGPT independiente como N/D.
+
+INDEPENDENCIA
+- A ChatGPT local se le pasan historial estructurado, forma, sets, H2H, rivales comunes, descanso, tabla y marcador LIVE disponible.
+- NO se le pasa el porcentaje ni la selección del motor local.
+- La web es enriquecimiento: planteles, ausencias, técnica, DT y contexto cuando exista evidencia.
+
+TIEMPOS
+- Mantiene un presupuesto total corto de análisis.
+- LIVE sigue priorizando rapidez; la web no puede bloquear la respuesta completa.
+- Si el juez final ChatGPT no termina, permanece el juez determinista de respaldo.
+
+LIVE
+- Mantiene el panel condicionado al marcador actual de V1.11.2.
+- No vuelve a mostrar marcadores finales imposibles ni líneas ya cumplidas como si siguieran abiertas.
+
+PRUEBAS
+- Compilación de bot.py.
+- Catálogo soberano, buscador realista, memoria/cero OpenAI en búsqueda.
+- Estado UNKNOWN resiliente.
+- Formato dinámico BO3/BO5.
+- LIVE condicionado.
+- Nuevo SELFTEST_CHATGPT_LOCAL_SIN_WEB: fuerza Timeout web y exige porcentaje de ChatGPT independiente basado en expediente local.

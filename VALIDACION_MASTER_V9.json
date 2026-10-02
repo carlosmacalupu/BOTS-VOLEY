@@ -1,0 +1,109 @@
+{
+  "version": "BOTS_BETANO_MASTER_UNICO_V9_ESPECIALIZADO_ECO_SOBERANO",
+  "validated_at": "2026-10-02",
+  "master_tests": 30,
+  "master_tests_status": "PASS",
+  "principles": [
+    "single_goal_distribution",
+    "over_ladder_0.5_to_5.5_visible",
+    "under_ceiling",
+    "category_specialization",
+    "pre_anchor",
+    "openai_single_pre_read",
+    "detail_no_openai",
+    "today_first_search",
+    "live_sovereign"
+  ],
+  "files": [
+    {
+      "name": ".env.example",
+      "bytes": 1106,
+      "sha256": "7faece41111b6607b168b71b2041250d77d5f0fb9714bc5e6ed3e52b50668926"
+    },
+    {
+      "name": ".gitignore",
+      "bytes": 45,
+      "sha256": "062e05f419ff97944cdf341457629c35a4c33a59ec998234f151ea5535ac7d64"
+    },
+    {
+      "name": "MASTER_NOTES.md",
+      "bytes": 1152,
+      "sha256": "dd77eb17e5db177b211da1e548aa588bbed3d5f88a0bf05bcc0fcb2ce9bcf54f"
+    },
+    {
+      "name": "Procfile",
+      "bytes": 22,
+      "sha256": "aaec5e8a41d20ae2c3b91631ed250e9135ba4994541373a963517ab96a7ef729"
+    },
+    {
+      "name": "README.md",
+      "bytes": 4911,
+      "sha256": "1b736f594ea6274c00f3cefc96ab6d2dbeb9d39f9be4be3d91de38574c7c2921"
+    },
+    {
+      "name": "ai.py",
+      "bytes": 13519,
+      "sha256": "c57253960d63328de7895aa8ddaa73a5d150f372abbf628ae75f456555ec16b3"
+    },
+    {
+      "name": "apifootball.py",
+      "bytes": 10802,
+      "sha256": "49a31d0c790f3293cfb5ba158eba7e791a1baa8205930c1f6a664b7331971d36"
+    },
+    {
+      "name": "backtest.py",
+      "bytes": 13088,
+      "sha256": "3ec67919e2b54e76a9a1342902395dbe6a1ac9dd6f3607e0b1e15f6fac5213b1"
+    },
+    {
+      "name": "bot.py",
+      "bytes": 95334,
+      "sha256": "36ab8f74c54a0e5760e5dd10f9cc4b76663fc2a243465476fc195475ca6b89d1"
+    },
+    {
+      "name": "model.py",
+      "bytes": 10133,
+      "sha256": "5aeaed4688146ea69c097f5cb841f3445ef6958162799e4261dc76013e4a9837"
+    },
+    {
+      "name": "oddspapi.py",
+      "bytes": 16333,
+      "sha256": "802931ebe7c78919fd5523c2d8255a35b971657ee58fd1bbdaa7c4d3c29c1549"
+    },
+    {
+      "name": "profiles.py",
+      "bytes": 3409,
+      "sha256": "3da2e63d97fbd022fa4862ea8e3cdae363fc26c68e1a2ca45acbb7836ae16353"
+    },
+    {
+      "name": "requirements.txt",
+      "bytes": 22,
+      "sha256": "f60c56661455ec23421f8d6c342e44e6da31efc7d9bd988e35c769c5f374eb41"
+    },
+    {
+      "name": "sovereign.py",
+      "bytes": 6122,
+      "sha256": "e9df7278debad5bf9b0a0046371d8370f403c36e23335cdf167d97f336e2c41a"
+    },
+    {
+      "name": "store.py",
+      "bytes": 8153,
+      "sha256": "680fa329daf4dcd94654228c4914946583a63d28b8b9cfeb4c9bd68c5f71a876"
+    },
+    {
+      "name": "test_all.py",
+      "bytes": 1386,
+      "sha256": "4139f2403289f49f969711632a3a65188f8cb9c57342a10480d2d50313304f95"
+    },
+    {
+      "name": "test_legacy_claude.py",
+      "bytes": 64952,
+      "sha256": "55f0d8dd2d37a82a21f661c7a294f8547547a5ba89441e75bc358b4d1c286691"
+    },
+    {
+      "name": "test_v9_master.py",
+      "bytes": 4594,
+      "sha256": "447d614971385f9f1660fe000caf7afe5afac7e376dc168577f4c1329cd41a3f"
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "version": "BOTS_BETANO_MASTER_UNICO_V10_EDGE_FINDER",
+  "master_v9_tests": {"passed": 30, "total": 30},
+  "edge_finder_tests": {"passed": 7, "total": 7},
+  "combined": {"passed": 37, "total": 37},
+  "py_compile": true,
+  "legacy_note": "test_legacy_claude.py contiene una prueba obsoleta que también falla sin cambios en MASTER V9; no es regresión V10"
+}

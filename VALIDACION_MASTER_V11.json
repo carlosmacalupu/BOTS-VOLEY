@@ -1,0 +1,16 @@
+{
+  "version": "BOTS_BETANO_MASTER_UNICO_V11_MODO_CONSERVADOR",
+  "master_tests": "30/30",
+  "edge_tests": "7/7",
+  "conservative_tests": "7/7",
+  "total": "44/44",
+  "py_compile": true,
+  "rules": {
+    "senior": "enabled, q>=88, p_cons>=97.5%, odds<=1.18, cushion>=1.5pp, consensus required",
+    "women": "enabled, stricter thresholds",
+    "youth": "blocked by default in /seguro",
+    "reserve": "blocked by default in /seguro",
+    "friendly": "blocked by default in /seguro",
+    "anchor_compat": "V10 anchors accepted to avoid extra OpenAI call"
+  }
+}

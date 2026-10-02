@@ -1,0 +1,15 @@
+BOTS VOLEY V1.11.2 — LIVE CONDICIONADO + ANALISIS RAPIDO
+
+Cambios principales:
+- Mantiene el Catalogo Soberano Global de V1.11.0.
+- Analisis con un unico presupuesto total: LIVE ~34 s por defecto; UNKNOWN ~42 s; PRE ~48 s.
+- BOT local y ChatGPT independiente trabajan en paralelo.
+- Si ChatGPT no termina, el juez determinista cierra la salida; no se encadenan varios minutos de timeout.
+- Evita refrescos de red repetidos durante el mismo analisis tras una actualizacion reciente.
+- Panel LIVE condicionado al marcador de sets actual y, cuando existen, puntos del set en curso.
+- Marcadores exactos imposibles desaparecen.
+- Lineas de sets ya alcanzadas se marcan YA CUMPLIDO; lineas matematicamente garantizadas por el marcador se marcan ASEGURADO POR MARCADOR.
+- Corredor y total de sets se recalculan desde el estado LIVE real.
+
+Variable opcional:
+VOLEY_ANALYSIS_TOTAL_SECONDS puede forzar un presupuesto total entre 28 y 60 segundos.

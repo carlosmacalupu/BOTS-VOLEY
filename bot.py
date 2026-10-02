@@ -1,4 +1,4 @@
-# BOTS VOLEY V1.10.5 — BUSCADOR FUGAZ + FMV DIRECTA + ANALISIS PROFUNDO + RESCATE SOBERANO + JUEZ FINAL
+# BOTS VOLEY V1.10.6 — BUSCADOR FUGAZ SIN OPENAI + FMV RESILIENTE + ANALISIS PROFUNDO + JUEZ FINAL
 import sys as _sys
 import types as _types
 
@@ -40,11 +40,11 @@ exec(compile('"""Evidence pipeline and experimental volleyball models. No claime
 
 import os, math, json, time, logging, re, unicodedata
 from datetime import datetime, timezone, timedelta
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 from urllib.error import HTTPError
 from urllib.request import urlopen, Request
 
-VERSION = "1.10.5"
+VERSION = "1.10.6"
 import analysis_engine as engine
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 WORKERS = ThreadPoolExecutor(max_workers=4)
@@ -107,7 +107,7 @@ def _memory_payload(m):
         'id','_source','_source_id','timestamp','date','teams','league','status','scores','points',
         '_fetched_at','_discovery_url','_official_url','_history_source_urls','_venue','_best_of',
         '_references','_periods','_neutral','_venue_unknown','_date_precision','_source_date',
-        '_tournament_key','_season_context_transfer','_original_league'
+        '_tournament_key','_season_context_transfer','_original_league','_team_aliases'
     }
     out={k:v for k,v in m.items() if k in allowed}
     # Round-trip JSON also removes accidental non-serializable provider objects.
@@ -123,6 +123,13 @@ def remember_match(m, query=None):
         now=time.time()
         queries={norm(query)} if query else set()
         queries.update({norm(h),norm(a),norm(h+' vs '+a),norm(a+' vs '+h)})
+        aliases=m.get('_team_aliases') or {}
+        home_aliases=[str(x) for x in aliases.get('home',[]) if str(x).strip()] if isinstance(aliases,dict) else []
+        away_aliases=[str(x) for x in aliases.get('away',[]) if str(x).strip()] if isinstance(aliases,dict) else []
+        queries.update(norm(x) for x in home_aliases+away_aliases)
+        for ha in home_aliases:
+            for aa in away_aliases:
+                queries.update({norm(ha+' vs '+aa),norm(aa+' vs '+ha)})
         queries={q for q in queries if q}
         with _MEMORY_LOCK:
             db=_memory_connect()
@@ -155,6 +162,7 @@ def memory_matches(query, day=None):
             try:
                 # 1) Consulta exacta ya realizada: vía más rápida.
                 records=db.execute("SELECT f.payload FROM query_index qi JOIN fixtures f ON f.match_id=qi.match_id WHERE qi.day=? AND qi.query_norm=? ORDER BY f.kickoff",(day,q)).fetchall()
+                exact=bool(records)
                 if not records:
                     # 2) Variación/nombre parcial: carga solo los fixtures ya conocidos de HOY
                     # y reutiliza el mismo fuzzy matcher del catálogo principal.
@@ -167,7 +175,9 @@ def memory_matches(query, day=None):
                 if isinstance(m,dict) and m.get('id') and m.get('timestamp'):rows.append(m)
             except Exception:pass
         if not rows:return []
-        found=sources.find_matches(query,sources.dedupe(rows))
+        # Si la consulta exacta ya fue indexada (incluido alias como ULP), no vuelvas
+        # a pasarla por un matcher que podría desconocer esa abreviatura.
+        found=sources.dedupe(rows) if exact else sources.find_matches(query,sources.dedupe(rows))
         for m in found:m['_memory_hit']=True
         return found
     except Exception as exc:
@@ -312,12 +322,14 @@ _FMV_CACHE_LOCK = _threading.RLock()
 _FMV_CLUBS_CACHE = (0.0, [])
 _FMV_DAY_CACHE = {}
 _FMV_SEED_ALIASES = {
-    # Semilla para que este caso funcione incluso durante el primer segundo tras deploy;
-    # el directorio oficial amplía automáticamente el mapa a los ~170 clubes.
-    "universitario de la plata": ("ULP", "Club Universitario de La Plata"),
-    "club universitario de la plata": ("ULP", "Club Universitario de La Plata"),
-    "ulp": ("ULP", "Club Universitario de La Plata"),
-    "harrods": ("HARRODS", "Club Harrods Gath & Chaves"),
+    # Alias oficiales/observados. El directorio vivo amplía automáticamente el mapa.
+    "universitario de la plata": ("ULP", "Universitario de La Plata"),
+    "club universitario de la plata": ("ULP", "Universitario de La Plata"),
+    "ulp": ("ULP", "Universitario de La Plata"),
+    "harrods": ("HARRODS", "Harrods"),
+}
+_FMV_SEED_CLUB_URLS = {
+    "ULP": "https://metrovoley.com.ar/clubs/538",
 }
 
 class _FastLinks(_HTMLParser):
@@ -337,7 +349,7 @@ def _fast_text(url, timeout=5):
     key='fast_text:'+url; now=time.monotonic()
     old=CACHE.get(key)
     if old and now-old[0] < 300:return old[1]
-    req=Request(url,headers={'User-Agent':'BOTS-VOLEY/1.10.5','Accept':'text/html,application/xhtml+xml'})
+    req=Request(url,headers={'User-Agent':'BOTS-VOLEY/1.10.6','Accept':'text/html,application/xhtml+xml'})
     with urlopen(req,timeout=timeout) as r:
         raw=r.read(3_000_001); enc=r.headers.get_content_charset() or 'utf-8'
     if len(raw)>3_000_000:raise ValueError('fmv_page_too_large')
@@ -355,6 +367,24 @@ def _fmv_code_from_card(text):
     m=re.search(r'([A-Z0-9][A-Z0-9._-]{1,13})\s*:',text or '')
     return m.group(1) if m else None
 
+def _fmv_match_id_from_href(href):
+    """Acepta /matches/123, matches/123 o URL absoluta; ignora query/fragment."""
+    try:
+        path=urlsplit(_urljoin(_FMV_BASE+'/',str(href or ''))).path.rstrip('/')
+    except Exception:
+        return None
+    m=re.search(r'/matches/(\d+)$',path)
+    return m.group(1) if m else None
+
+def _fmv_club_id_from_href(href):
+    try:
+        path=urlsplit(_urljoin(_FMV_BASE+'/',str(href or ''))).path.rstrip('/')
+    except Exception:
+        return None
+    m=re.search(r'/clubs/(\d+)$',path)
+    return m.group(1) if m else None
+
+
 def _fmv_directory(force=False):
     global _FMV_CLUBS_CACHE
     now=time.monotonic()
@@ -369,15 +399,16 @@ def _fmv_directory(force=False):
     with ThreadPoolExecutor(max_workers=8) as pool:
         for links in pool.map(one,range(1,9)):
             for href,text in links:
-                if not re.fullmatch(r'/clubs/\d+',str(href or '')):continue
+                club_id=_fmv_club_id_from_href(href)
+                if not club_id:continue
                 code=_fmv_code_from_card(text)
                 if not code:continue
                 pos=text.find(code); full=(text[:pos].strip(' ·-') if pos>0 else code)
                 if not full:full=code
-                rows.append({'code':code,'name':full,'url':_urljoin(_FMV_BASE,href),'raw':text})
+                rows.append({'code':code,'name':full,'url':f'{_FMV_BASE}/clubs/{club_id}','raw':text})
     # Semillas + directorio vivo. Dedupe por código/nombre.
     for alias,(code,name) in _FMV_SEED_ALIASES.items():
-        rows.append({'code':code,'name':name,'url':'','raw':name+' '+code})
+        rows.append({'code':code,'name':name,'url':_FMV_SEED_CLUB_URLS.get(code,''),'raw':name+' '+code})
     seen=set(); clean=[]
     for r in rows:
         k=(norm(r['code']),norm(r['name']))
@@ -394,7 +425,7 @@ def _fmv_alias_targets(query):
     seeded=[]; missing=[]
     for part in parts:
         seed=_FMV_SEED_ALIASES.get(norm(part))
-        if seed:seeded.append({'code':seed[0],'name':seed[1],'score':1.0,'_seed':True})
+        if seed:seeded.append({'code':seed[0],'name':seed[1],'url':_FMV_SEED_CLUB_URLS.get(seed[0],''),'score':1.0,'_seed':True})
         else:missing.append(part)
     if not missing:return seeded
     clubs=_fmv_directory(False)
@@ -453,8 +484,27 @@ def _fmv_parse_match_card(match_id, text, clubs, year):
     m=sources.make_match('fmv',str(match_id),dt.timestamp(),home,away,league,state,{})
     if not m:return None
     url=f'{_FMV_BASE}/matches/{match_id}'
-    m.update(_official_url=url,_discovery_url=url,_history_source_urls=[url],_best_of=5,_fmv_gender=gender,_fmv_category=category)
+    m.update(_official_url=url,_discovery_url=url,_history_source_urls=[url],_best_of=5,_fmv_gender=gender,_fmv_category=category,
+             _team_aliases={'home':[hcode,home],'away':[acode,away]})
     return m
+
+def _fmv_rows_from_links(links, clubs, day):
+    year=datetime.fromisoformat(day).year; rows=[];seen=set()
+    for href,text in links:
+        mid=_fmv_match_id_from_href(href)
+        if not mid or mid in seen:continue
+        seen.add(mid)
+        m=_fmv_parse_match_card(mid,text,clubs,year)
+        if m and sources.day_of(m)==day:rows.append(m)
+    return rows
+
+def _fmv_club_pages(targets):
+    pages=[]
+    for t in targets or []:
+        base=str(t.get('url') or '').rstrip('/')
+        if base:
+            pages.extend([base,base+'/matches'])
+    return list(dict.fromkeys(pages))
 
 def fmv_fast_catalog(day=None, force=False):
     day=day or datetime.now(LIMA).date().isoformat()
@@ -463,18 +513,18 @@ def fmv_fast_catalog(day=None, force=False):
         old=_FMV_DAY_CACHE.get(day)
         if old and not force and now-old[0]<120:return old[1]
     clubs=_fmv_directory(False)
-    # Aun si el directorio fallara, las semillas conocidas permiten resolver casos ya aprendidos.
     if not clubs:
-        clubs=[{'code':v[0],'name':v[1],'url':'','raw':k} for k,v in _FMV_SEED_ALIASES.items()]
-    try:links=_links_from(f'{_FMV_BASE}/matches?date={day}',5)
-    except Exception as exc:
-        log.info('FMV rápido no disponible: %s',type(exc).__name__);return []
-    year=datetime.fromisoformat(day).year; rows=[];seen=set()
-    for href,text in links:
-        mm=re.fullmatch(r'/matches/(\d+)',str(href or ''))
-        if not mm or mm.group(1) in seen:continue
-        seen.add(mm.group(1));m=_fmv_parse_match_card(mm.group(1),text,clubs,year)
-        if m and sources.day_of(m)==day:rows.append(m)
+        clubs=[{'code':v[0],'name':v[1],'url':_FMV_SEED_CLUB_URLS.get(v[0],''),'raw':k} for k,v in _FMV_SEED_ALIASES.items()]
+    # Metrovoley puede ignorar parámetros de fecha o cambiar su formato. Probamos
+    # la portada de partidos y dos variantes de fecha, todas deterministas.
+    urls=[f'{_FMV_BASE}/matches',f'{_FMV_BASE}/matches?date={day}',f'{_FMV_BASE}/matches?day={day}']
+    rows=[]
+    for url in urls:
+        try:
+            rows.extend(_fmv_rows_from_links(_links_from(url,4),clubs,day))
+            if rows:break
+        except Exception as exc:
+            log.info('FMV calendario rápido %s: %s',url,type(exc).__name__)
     rows=sources.dedupe(rows)
     with _FMV_CACHE_LOCK:_FMV_DAY_CACHE[day]=(now,rows)
     if rows:remember_matches(rows)
@@ -483,20 +533,44 @@ def fmv_fast_catalog(day=None, force=False):
 def fmv_fast_search(query, day=None):
     day=day or datetime.now(LIMA).date().isoformat()
     targets=_fmv_alias_targets(query)
+    # Para un alias ya conocido (p.ej. ULP), NO descargamos primero todo el
+    # directorio. Vamos directo a la página oficial del club: menos latencia y
+    # menos puntos de fallo. Las semillas alcanzan para parsear ULP-HARRODS.
+    seed_clubs=[{'code':v[0],'name':v[1],'url':_FMV_SEED_CLUB_URLS.get(v[0],''),'raw':k} for k,v in _FMV_SEED_ALIASES.items()]
+    if targets and all(t.get('_seed') for t in targets):
+        direct=[]
+        for url in _fmv_club_pages(targets):
+            try:direct.extend(_fmv_rows_from_links(_links_from(url,4),seed_clubs,day))
+            except Exception as exc:log.info('FMV club directo %s: %s',url,type(exc).__name__)
+        direct=sources.dedupe(direct)
+        if direct:
+            remember_matches(direct,query)
+            found=sources.find_matches(query,direct)
+            if found:return found
+    # Para clubes no sembrados, el directorio vivo resuelve código/nombre/URL.
+    clubs=_fmv_directory(False) or seed_clubs
     rows=fmv_fast_catalog(day)
-    if not rows:return []
-    # Si tenemos alias oficial, convierte la consulta al código/nombre resuelto y filtra sin IA.
+    found=sources.find_matches(query,rows) if rows else []
+    if found:return found
+    # Rescate DIRECTO por club si el calendario diario cambia de formato.
+    direct=[]
+    for url in _fmv_club_pages(targets):
+        try:direct.extend(_fmv_rows_from_links(_links_from(url,4),clubs,day))
+        except Exception as exc:log.info('FMV club rápido %s: %s',url,type(exc).__name__)
+    direct=sources.dedupe(direct)
+    if direct:
+        remember_matches(direct,query)
+        found=sources.find_matches(query,direct)
+        if found:return found
     if targets:
-        parts=sources.query_parts(query)
-        wanted=[norm(t['name']) for t in targets]+[norm(t['code']) for t in targets]
+        wanted={norm(t['code']) for t in targets}|{norm(t['name']) for t in targets}
         out=[]
-        for m in rows:
+        for m in rows+direct:
             hn=norm(m['teams']['home']['name']);an=norm(m['teams']['away']['name'])
-            matched=sum(1 for t in targets if max(sources.name_score(t['name'],hn),sources.name_score(t['name'],an),
-                                                   sources.name_score(t['code'],hn),sources.name_score(t['code'],an))>=.76)
-            if matched>=min(len(parts),len(targets)):out.append(m)
-        if out:return sorted(out,key=lambda x:x['timestamp'])[:30]
-    return sources.find_matches(query,rows)
+            if any(max(sources.name_score(w,hn),sources.name_score(w,an))>=.76 for w in wanted):out.append(m)
+        return sources.dedupe(out)[:30]
+    return []
+
 
 def fast_web_discover(query, day=None):
     """Una sola búsqueda web corta para LOCALIZAR; nunca hace el análisis deportivo."""
@@ -772,7 +846,7 @@ def handle(chat_id,text):
     t=(text or '').strip()
     if not t: return
     if t.lower() in {'/start','start','inicio'}:
-        send(chat_id, '🏐 BOTS VÓLEY V1.10.5\nEscribe los equipos, PARTIDOS DE HOY o AHORA.\nBUSCADOR FUGAZ separado del ANÁLISIS PROFUNDO · memoria + FMV directa + BOT / ChatGPT / JUEZ FINAL.'); return
+        send(chat_id, '🏐 BOTS VÓLEY V1.10.6\nEscribe los equipos, PARTIDOS DE HOY o AHORA.\nBUSCADOR FUGAZ SIN OPENAI · memoria + fuentes deportivas directas. El análisis profundo empieza después de elegir el partido.'); return
     state=STATE.setdefault(chat_id, {})
     set_query=re.search(r'\bset\s*([1-5])\b',norm(t))
     if set_query and state.get('_active') and len(norm(t).split())<=7:
@@ -798,50 +872,58 @@ def handle(chat_id,text):
         d,rows=today_catalog(); remember_matches(rows)
         list_catalog(chat_id, rows); return
 
-    # BUSCADOR FUGAZ V1.10.5. Localizar y analizar son dos trabajos separados.
-    # 1) memoria; 2) FMV oficial directa; 3) API/buscador deportivo dirigido;
-    # 4) una sola búsqueda web corta. El análisis profundo empieza tras elegir el número.
+    # BUSCADOR FUGAZ V1.10.6. Localización y análisis son procesos separados.
+    # REGLA DURA: cero llamadas OpenAI aquí. OpenAI empieza únicamente tras elegir 1/2/3.
     matches=memory_matches(t)
-    discovery_error=None
     d={'response':[],'errors':{},'_meta':{}}
     if not matches:
-        try:matches=fmv_fast_search(t)
+        # FMV directa primero: si el club está allí, no gastamos otras APIs.
+        try:matches=fmv_fast_search(t) or []
         except Exception as exc:
             log.info('FMV rápido: %s',type(exc).__name__);matches=[]
-        remember_matches(matches,t)
+        if matches:remember_matches(matches,t)
     if not matches:
-        pool=ThreadPoolExecutor(max_workers=1)
-        fut=pool.submit(sources.search_extra,t)
+        # Solo si FMV no resolvió: proveedores deportivos en paralelo.
+        pool=ThreadPoolExecutor(max_workers=2)
+        jobs=[pool.submit(sources.search_extra,t),pool.submit(today_catalog)]
+        deadline=time.monotonic()+10.0
+        collected=[]
         try:
-            matches=fut.result(timeout=8) or []
-            remember_matches(matches,t)
-        except FutureTimeout:
-            log.info('Buscador API dirigido agotó 8 s')
-        except Exception as exc:
-            log.info('Buscador API dirigido: %s',type(exc).__name__)
+            for fut in jobs:
+                left=max(0.05,deadline-time.monotonic())
+                if left<=0:break
+                try:
+                    value=fut.result(timeout=left)
+                    if isinstance(value,tuple) and len(value)==2 and isinstance(value[1],list):
+                        cat=value[1];collected.extend(sources.find_matches(t,cat));remember_matches(cat)
+                    elif isinstance(value,list):collected.extend(value)
+                except FutureTimeout:continue
+                except Exception as exc:log.info('Buscador deportivo rápido: %s',type(exc).__name__)
+                if collected:
+                    matches=sources.dedupe(collected);break
         finally:
             pool.shutdown(wait=False,cancel_futures=True)
+        if matches:remember_matches(matches,t)
     if not matches:
+        # Flashscore se usa solo como detector de nombres/enlaces. Si aporta candidatos,
+        # se reintenta en proveedores deportivos; nunca se manda la consulta a OpenAI.
         try:
-            matches=fast_web_discover(t)
-            remember_matches(matches,t)
-        except engine.AIError as exc:discovery_error=str(exc)
+            candidates=sources.public_calendars.flashscore_candidates(t)
         except Exception as exc:
-            discovery_error='fast_locator_'+type(exc).__name__
+            log.info('Flashscore rápido: %s',type(exc).__name__);candidates=[]
+        for c in candidates[:4]:
+            q=f"{c.get('home','')} vs {c.get('away','')}".strip()
+            if not q:continue
+            try:
+                rows=sources.search_extra(q) or []
+                rows=sources.find_matches(t,rows) or rows
+                if rows:
+                    matches=rows;remember_matches(rows,t);break
+            except Exception as exc:log.info('Revalidación deportiva Flashscore: %s',type(exc).__name__)
     if matches:
         remember_matches(matches,t)
     if not matches:
-        reasons={str(x) for values in d.get('_meta',{}).values() for x in values}
-        diagnosis=''
-        if reasons & {'clave_no_aceptada','http_401'}:diagnosis=' Además, una fuente rechazó la clave de acceso.'
-        elif reasons & {'limite_consultas','http_429'}:diagnosis=' Además, una fuente alcanzó su límite de consultas.'
-        elif reasons & {'acceso_o_plan','http_403'}:diagnosis=' Además, una fuente rechazó el acceso; revisa el plan o los permisos.'
-        if discovery_error=='missing_key':
-            send(chat_id,'Las fuentes del catálogo no devolvieron ese encuentro. La búsqueda web de respaldo no pudo ejecutarse: falta OPENAI_API_KEY en Railway.'+diagnosis);return
-        if discovery_error:
-            log.warning('Busqueda web: %s',engine.ai_error_text(discovery_error))
-            send(chat_id,'La búsqueda web de respaldo falló. '+engine.ai_error_text(discovery_error)+' No se confirmó si hay partido hoy.'+diagnosis);return
-        send(chat_id,'No pude confirmar ese encuentro de HOY en las fuentes disponibles. Puede faltar cobertura o estar registrado en otra categoría. El partido no se da por inexistente.'); return
+        send(chat_id,'No encontré una coincidencia confirmada de HOY en los buscadores deportivos rápidos. No se consumió análisis ChatGPT. Prueba el nombre corto, abreviatura o rival.'); return
     state['_options']=matches
     memory_hit=bool(matches and all(m.get('_memory_hit') for m in matches))
     lines=['🏐 Coincidencias de HOY' + (' · MEMORIA' if memory_hit else '')]

@@ -1,4 +1,4 @@
-# BOTS VOLEY V1.10.6 — BUSCADOR FUGAZ SIN OPENAI + FMV RESILIENTE + ANALISIS PROFUNDO + JUEZ FINAL
+# BOTS VOLEY V1.10.7 — BUSCADOR FUGAZ MULTITRANSPORTE + FMV READER + ANALISIS PROFUNDO + JUEZ FINAL
 import sys as _sys
 import types as _types
 
@@ -44,7 +44,7 @@ from urllib.parse import urlencode, urlsplit
 from urllib.error import HTTPError
 from urllib.request import urlopen, Request
 
-VERSION = "1.10.6"
+VERSION = "1.10.7"
 import analysis_engine as engine
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 WORKERS = ThreadPoolExecutor(max_workers=4)
@@ -327,9 +327,12 @@ _FMV_SEED_ALIASES = {
     "club universitario de la plata": ("ULP", "Universitario de La Plata"),
     "ulp": ("ULP", "Universitario de La Plata"),
     "harrods": ("HARRODS", "Harrods"),
+    "harrods gath chaves": ("HARRODS", "Harrods"),
+    "club harrods gath chaves": ("HARRODS", "Harrods"),
 }
 _FMV_SEED_CLUB_URLS = {
     "ULP": "https://metrovoley.com.ar/clubs/538",
+    "HARRODS": "https://metrovoley.com.ar/clubs/582",
 }
 
 class _FastLinks(_HTMLParser):
@@ -357,6 +360,159 @@ def _fast_text(url, timeout=5):
 
 def _links_from(url, timeout=5):
     p=_FastLinks(); p.feed(_fast_text(url,timeout)); return p.links
+
+
+def _reader_text(url, timeout=10):
+    """Segundo transporte web, sin OpenAI.
+
+    Jina Reader obtiene/renderiza la URL desde otro servidor. Se usa SOLO como
+    respaldo cuando el origen directo de una federación no responde igual desde
+    Railway. No hace razonamiento ni pronósticos.
+    """
+    key='reader_text:'+url; now=time.monotonic()
+    old=CACHE.get(key)
+    if old and now-old[0] < 300:return old[1]
+    endpoint='https://r.jina.ai/'+url
+    headers={
+        'User-Agent':'BOTS-VOLEY/1.10.7',
+        'Accept':'text/plain,text/markdown;q=0.9,*/*;q=0.1',
+        'X-Timeout':str(max(4,min(12,int(timeout)))),
+    }
+    jina_key=os.getenv('JINA_API_KEY','').strip()
+    if jina_key:headers['Authorization']='Bearer '+jina_key
+    req=Request(endpoint,headers=headers)
+    with urlopen(req,timeout=timeout+2) as r:
+        raw=r.read(2_000_001); enc=r.headers.get_content_charset() or 'utf-8'
+    if len(raw)>2_000_000:raise ValueError('reader_page_too_large')
+    text=raw.decode(enc,errors='replace')
+    CACHE[key]=(now,text)
+    return text
+
+
+def _fmv_directory_rows_from_reader(text):
+    """Extrae club, código y URL desde el Markdown/texto de Reader."""
+    rows=[]
+    # Reader suele devolver cada tarjeta como [texto](URL). También toleramos URL relativa.
+    patt=re.compile(r'\[([^\]]{2,500})\]\((https?://metrovoley\.com\.ar)?(/clubs/\d+)(?:[^)]*)\)',re.I)
+    for m in patt.finditer(text or ''):
+        card=' '.join(m.group(1).split()); href=(m.group(2) or _FMV_BASE)+m.group(3)
+        code=_fmv_code_from_card(card)
+        if not code:continue
+        pos=card.upper().find(code.upper())
+        full=card[:pos].strip(' ·-') if pos>0 else code
+        if not full:full=code
+        rows.append({'code':code,'name':full,'url':href,'raw':card})
+    return rows
+
+
+def _fmv_target_pair(teams_raw, targets):
+    """Rescate para una página de club cuando no conocemos aún el código rival."""
+    raw=' '.join((teams_raw or '').replace('[',' ').replace(']',' ').split())
+    # Quita una URL Markdown residual y textos posteriores obvios.
+    raw=re.sub(r'\([^)]*https?://[^)]*\)',' ',raw)
+    raw=' '.join(raw.split())
+    for t in targets or []:
+        code=str(t.get('code') or '').strip()
+        if not code:continue
+        esc=re.escape(code)
+        m=re.match(r'^'+esc+r'\b\s+(.+)$',raw,re.I)
+        if m:
+            opp=re.split(r'\s+(?=\d{1,3}\b)',m.group(1).strip(),1)[0].strip(' ·-')
+            if opp:return code,opp
+        m=re.match(r'^(.+?)\s+'+esc+r'\b(?:\s|$)',raw,re.I)
+        if m:
+            home=re.split(r'\s+(?=\d{1,3}\b)',m.group(1).strip(),1)[0].strip(' ·-')
+            if home:return home,code
+    return None
+
+
+def _fmv_rows_from_reader(text, clubs, day, source_url, targets=None):
+    """Parsea partidos FMV desde texto renderizado (Reader), no depende del DOM."""
+    if not text:return []
+    # Markdown puede concatenar muchas tarjetas; cada una comienza con número + Campeonato Oficial.
+    clean=text.replace('\r','\n')
+    starts=[m.start() for m in re.finditer(r'(?<!\d)\[?\d{4,6}\s+Campeonato Oficial\b',clean,re.I)]
+    if not starts:return []
+    starts.append(len(clean)); rows=[]; year=datetime.fromisoformat(day).year
+    bycode={norm(c.get('code')):c.get('name') or c.get('code') for c in clubs if c.get('code')}
+    for i in range(len(starts)-1):
+        seg=clean[starts[i]:min(starts[i+1],starts[i]+1000)]
+        urlm=re.search(r'https?://metrovoley\.com\.ar/matches/(\d+)',seg,re.I)
+        official=urlm.group(0) if urlm else source_url
+        mid=urlm.group(1) if urlm else None
+        # Quita sintaxis Markdown sin borrar el texto visible de la tarjeta.
+        visible=re.sub(r'\]\([^)]*\)',']',seg)
+        visible=re.sub(r'[\[\]`*_#]',' ',visible)
+        visible=' '.join(visible.split())
+        num=re.match(r'(\d{4,6})\s+Campeonato Oficial\b',visible,re.I)
+        if not num:continue
+        dtm=re.search(r'\b(?:lun|mar|mi[eé]|jue|vie|s[aá]b|dom)\s+(\d{1,2})\s+([A-Za-záéíóúÁÉÍÓÚ]{3,})\s+(\d{1,2}):(\d{2})\b',visible,re.I)
+        if not dtm:continue
+        d=int(dtm.group(1)); mon=_FMV_MONTHS.get(norm(dtm.group(2))[:3]); hh=int(dtm.group(3)); mm=int(dtm.group(4))
+        if not mon:continue
+        tail=visible[dtm.end():].strip()
+        gm=re.search(r'(.+?)\s*[·•]\s*(Femenino|Masculino)\s+(.+)$',tail,re.I)
+        if not gm:continue
+        category=' '.join(gm.group(1).split()); gender=gm.group(2).capitalize(); teams_raw=gm.group(3).strip()
+        pair=_fmv_split_teams(teams_raw,clubs) or _fmv_target_pair(teams_raw,targets or [])
+        if not pair:continue
+        hcode,acode=pair
+        home=bycode.get(norm(hcode),str(hcode).strip()); away=bycode.get(norm(acode),str(acode).strip())
+        if not home or not away or norm(home)==norm(away):continue
+        arg=timezone(timedelta(hours=-3))
+        try:dt=datetime(year,mon,d,hh,mm,tzinfo=arg)
+        except ValueError:continue
+        if dt.astimezone(LIMA).date().isoformat()!=day:continue
+        state='NS' if dt.timestamp()>time.time() else 'UNKNOWN'
+        league=f'FMV Campeonato Oficial — {category} ({"F" if gender=="Femenino" else "M"})'
+        source_id=mid or ('card-'+num.group(1)+'-'+str(int(dt.timestamp())))
+        m=sources.make_match('fmv',source_id,dt.timestamp(),home,away,league,state,{})
+        if not m:continue
+        m.update(_official_url=official,_discovery_url=source_url,_history_source_urls=[official],_best_of=5,
+                 _fmv_gender=gender,_fmv_category=category,
+                 _team_aliases={'home':[str(hcode),home],'away':[str(acode),away]},_reader_fallback=True)
+        rows.append(m)
+    return sources.dedupe(rows)
+
+
+def _fmv_seed_lookup(query, targets, day):
+    """Para alias conocidos, prueba origen FMV y Reader EN PARALELO; devuelve el primero válido."""
+    seeds=[{'code':v[0],'name':v[1],'url':_FMV_SEED_CLUB_URLS.get(v[0],''),'raw':k} for k,v in _FMV_SEED_ALIASES.items()]
+    known=[];seen=set()
+    for c in seeds+list(targets or []):
+        k=norm(c.get('code'))
+        if k and k not in seen:seen.add(k);known.append(c)
+    urls=list(dict.fromkeys(str(t.get('url') or '').rstrip('/') for t in targets or [] if t.get('url')))
+    if not urls:return []
+    from concurrent.futures import ThreadPoolExecutor as _TPE, wait as _wait, FIRST_COMPLETED as _FIRST
+    pool=_TPE(max_workers=min(4,max(2,len(urls)*2)))
+    pending={}
+    for url in urls:
+        pending[pool.submit(_links_from,url,4)]=('html',url)
+        pending[pool.submit(_reader_text,url,9)]=('reader',url)
+    deadline=time.monotonic()+10.5
+    try:
+        while pending and time.monotonic()<deadline:
+            done,_=_wait(list(pending),timeout=max(.05,deadline-time.monotonic()),return_when=_FIRST)
+            if not done:break
+            for fut in done:
+                kind,url=pending.pop(fut)
+                try:
+                    value=fut.result()
+                    rows=(_fmv_rows_from_links(value,known,day) if kind=='html'
+                          else _fmv_rows_from_reader(value,known,day,url,targets))
+                    found=sources.find_matches(query,rows) if rows else []
+                    if found:
+                        for f in pending:f.cancel()
+                        pool.shutdown(wait=False,cancel_futures=True)
+                        remember_matches(found,query)
+                        return found
+                except Exception as exc:
+                    log.info('FMV %s transporte %s: %s',kind,url,type(exc).__name__)
+    finally:
+        try:pool.shutdown(wait=False,cancel_futures=True)
+        except Exception:pass
+    return []
 
 def _fmv_code_from_card(text):
     # En /clubs el código aparece normalmente dos veces: NOMBRE + CODIGO + "CODIGO: dirección".
@@ -395,7 +551,8 @@ def _fmv_directory(force=False):
         try:return _links_from(f'{_FMV_BASE}/clubs?page={page}',4)
         except Exception:return []
     rows=[]
-    # Directorio pequeño (8 páginas). Se precarga al iniciar y se conserva 12 h.
+    # Directorio pequeño (8 páginas). Primero origen directo; si Railway recibe
+    # HTML vacío/bloqueado, Reader renderiza las mismas páginas desde otro transporte.
     with ThreadPoolExecutor(max_workers=8) as pool:
         for links in pool.map(one,range(1,9)):
             for href,text in links:
@@ -406,6 +563,14 @@ def _fmv_directory(force=False):
                 pos=text.find(code); full=(text[:pos].strip(' ·-') if pos>0 else code)
                 if not full:full=code
                 rows.append({'code':code,'name':full,'url':f'{_FMV_BASE}/clubs/{club_id}','raw':text})
+    if len(rows)<20:
+        def reader_page(page):
+            url=f'{_FMV_BASE}/clubs?page={page}'
+            try:return _fmv_directory_rows_from_reader(_reader_text(url,10))
+            except Exception as exc:
+                log.info('FMV directorio Reader p%s: %s',page,type(exc).__name__);return []
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            for batch in pool.map(reader_page,range(1,9)):rows.extend(batch)
     # Semillas + directorio vivo. Dedupe por código/nombre.
     for alias,(code,name) in _FMV_SEED_ALIASES.items():
         rows.append({'code':code,'name':name,'url':_FMV_SEED_CLUB_URLS.get(code,''),'raw':name+' '+code})
@@ -525,6 +690,14 @@ def fmv_fast_catalog(day=None, force=False):
             if rows:break
         except Exception as exc:
             log.info('FMV calendario rápido %s: %s',url,type(exc).__name__)
+    if not rows:
+        # Segundo transporte: página renderizada. Sigue sin usar OpenAI.
+        for url in urls[:2]:
+            try:
+                rows.extend(_fmv_rows_from_reader(_reader_text(url,9),clubs,day,url,[]))
+                if rows:break
+            except Exception as exc:
+                log.info('FMV calendario Reader %s: %s',url,type(exc).__name__)
     rows=sources.dedupe(rows)
     with _FMV_CACHE_LOCK:_FMV_DAY_CACHE[day]=(now,rows)
     if rows:remember_matches(rows)
@@ -538,15 +711,10 @@ def fmv_fast_search(query, day=None):
     # menos puntos de fallo. Las semillas alcanzan para parsear ULP-HARRODS.
     seed_clubs=[{'code':v[0],'name':v[1],'url':_FMV_SEED_CLUB_URLS.get(v[0],''),'raw':k} for k,v in _FMV_SEED_ALIASES.items()]
     if targets and all(t.get('_seed') for t in targets):
-        direct=[]
-        for url in _fmv_club_pages(targets):
-            try:direct.extend(_fmv_rows_from_links(_links_from(url,4),seed_clubs,day))
-            except Exception as exc:log.info('FMV club directo %s: %s',url,type(exc).__name__)
-        direct=sources.dedupe(direct)
-        if direct:
-            remember_matches(direct,query)
-            found=sources.find_matches(query,direct)
-            if found:return found
+        # Origen y Reader se lanzan en paralelo. Esto cubre el caso real en que
+        # Metrovoley responde distinto o bloquea una IP de Railway.
+        found=_fmv_seed_lookup(query,targets,day)
+        if found:return found
     # Para clubes no sembrados, el directorio vivo resuelve código/nombre/URL.
     clubs=_fmv_directory(False) or seed_clubs
     rows=fmv_fast_catalog(day)
@@ -557,6 +725,10 @@ def fmv_fast_search(query, day=None):
     for url in _fmv_club_pages(targets):
         try:direct.extend(_fmv_rows_from_links(_links_from(url,4),clubs,day))
         except Exception as exc:log.info('FMV club rápido %s: %s',url,type(exc).__name__)
+    if not direct:
+        for url in _fmv_club_pages(targets)[:2]:
+            try:direct.extend(_fmv_rows_from_reader(_reader_text(url,9),clubs,day,url,targets))
+            except Exception as exc:log.info('FMV club Reader %s: %s',url,type(exc).__name__)
     direct=sources.dedupe(direct)
     if direct:
         remember_matches(direct,query)
@@ -956,7 +1128,7 @@ def dispatch(chat_id, text):
 def main():
     if not TELEGRAM_TOKEN: raise SystemExit("Falta TELEGRAM_BOT_TOKEN")
     
-    log.info("BOTS VÓLEY V%s iniciado: buscador fugaz + análisis profundo", VERSION)
+    log.info("BOTS VÓLEY V%s iniciado: buscador fugaz multitransporte + análisis profundo", VERSION)
     # Precarga en segundo plano: no retrasa el inicio de Telegram.
     _threading.Thread(target=_warm_fast_locator,name="fmv-warm",daemon=True).start()
     ms=memory_stats(); log.info("Memoria fixtures: hoy=%s total=%s",ms['today'],ms['total'])

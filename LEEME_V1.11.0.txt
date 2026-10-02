@@ -1,0 +1,52 @@
+BOTS VÓLEY V1.11.0 — CATÁLOGO SOBERANO GLOBAL
+
+OBJETIVO
+Localizar primero los encuentros de HOY con la mayor cobertura determinista posible y sin gastar OpenAI. El análisis BOT + ChatGPT + JUEZ comienza únicamente después de seleccionar el partido.
+
+CATÁLOGO SOBERANO
+- API-Sports Volleyball (si VOLLEY_API_KEY está configurada)
+- SofaScore, calendario diario
+- TheSportsDB
+- FMV / Metrovoley directo + segundo transporte Reader
+- FPV calendario oficial
+- NORCECA / calendarios oficiales ya conectados
+- Calendarios públicos ya conectados
+- Flashscore como índice adicional de candidatos/nombres; nunca inventa fecha u hora. Un candidato se revalida antes de mostrarse como fixture confirmado.
+
+COMPORTAMIENTO
+1. Al iniciar Railway, arma el catálogo del día en segundo plano.
+2. Fusiona duplicados entre proveedores y conserva nombres alternativos como alias.
+3. Guarda el catálogo completo en SQLite. Con Railway Volume, la memoria sobrevive redeploys.
+4. Se refresca automáticamente cada VOLEY_CATALOG_TTL_SECONDS (600 s por defecto).
+5. Al escribir un equipo busca primero en SQLite/local. No llama OpenAI para localizar.
+6. Si no aparece, activa rescates deterministas: FMV + proveedores dirigidos + candidatos Flashscore revalidados.
+7. Después de elegir 1/2/3 entra el análisis profundo y el formato dinámico de sets.
+
+VARIABLES
+TELEGRAM_BOT_TOKEN              obligatoria
+VOLLEY_API_KEY                  recomendada para ampliar API-Sports
+OPENAI_API_KEY                  usada solo en el análisis profundo
+VOLEY_DATA_DIR                  opcional; recomendado /data con Railway Volume
+VOLEY_CATALOG_TTL_SECONDS       opcional; defecto 600
+VOLEY_CATALOG_COLD_WAIT_SECONDS opcional; defecto 8
+SPORTSDB_API_KEY                opcional; defecto público 123
+ENABLE_SOFASCORE                opcional; defecto 1
+
+PRUEBAS INCLUIDAS
+SELFTEST_CATALOGO_SOBERANO.py
+SELFTEST_BUSCADOR_REALISTA.py
+SELFTEST_MEMORIA_Y_CERO_OPENAI.py
+SELFTEST_ESTADO_DESCONOCIDO_NO_BLOQUEA.py
+SELFTEST_FORMATO_DINAMICO.py
+
+VALIDADO EN ESTA ENTREGA
+- Compilación de bot.py
+- Fusión de proveedores y deduplicación
+- Persistencia SQLite + alias
+- Búsqueda ULP desde memoria sin OpenAI
+- FMV directo caído -> Reader localiza el fixture
+- Estado UNKNOWN no cancela el análisis
+- Formato dinámico BO3/BO5
+
+IMPORTANTE
+Ningún proveedor público cubre literalmente todo encuentro amateur del planeta. V1.11.0 maximiza cobertura fusionando fuentes y usando rescates sin convertir candidatos no verificados en partidos confirmados.
